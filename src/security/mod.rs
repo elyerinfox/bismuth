@@ -26,6 +26,8 @@ pub mod keystore;
 #[cfg(feature = "tpm")]
 pub mod trust;
 #[cfg(feature = "tpm")]
+pub mod tpm_tis;
+#[cfg(feature = "tpm")]
 pub mod retained;
 #[cfg(all(feature = "containers", feature = "crypto"))]
 pub mod bundle;

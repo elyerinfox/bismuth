@@ -35,6 +35,7 @@ pub mod input;
 pub mod ioctl;
 pub mod middleware;
 pub mod sensor;
+pub mod spi;
 
 use core::fmt;
 
