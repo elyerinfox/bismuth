@@ -1,0 +1,24 @@
+[package]
+name = "bismuth-board-qemu-lm3s6965"
+version = "0.1.0"
+edition = "2024"
+description = "Bismuth demo for the QEMU lm3s6965evb machine (Cortex-M3)"
+publish = false
+
+# Standalone: built for thumbv7m-none-eabi, independent of the kernel's host workspace.
+[workspace]
+
+[dependencies]
+bismuth-kernel = { path = "../..", default-features = false, features = ["edge"] }
+cortex-m-rt = "0.7.5"
+cortex-m-semihosting = "0.5"
+
+[profile.dev]
+opt-level = "s"
+debug = true
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true

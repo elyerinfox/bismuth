@@ -1,0 +1,77 @@
+[package]
+name = "bismuth-kernel"
+version = "0.1.0"
+edition = "2024"
+description = "Bismuth: a modular, lightweight real-time kernel for edge-computing IoT devices"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["rtos", "embedded", "iot", "no-std", "posix"]
+categories = ["embedded", "no-std", "os"]
+
+[lib]
+name = "bismuth"
+
+[features]
+default = ["posix", "hal-compat", "freertos-compat", "edge", "net", "net-ip", "crypto", "containers", "net-filter", "fs", "power", "extensions", "tpm", "shell"]
+# POSIX-style API (pthreads, semaphores, mqueues, clocks, file descriptors on devices).
+posix = []
+# Export the POSIX API under the real C symbol names (`pthread_create`, `open`, ...).
+# Only enable on bare-metal targets: on a hosted OS it would clash with libc.
+posix-abi = ["posix"]
+# Adapters between Bismuth drivers and the embedded-hal / embedded-io ecosystem.
+hal-compat = ["dep:embedded-hal", "dep:embedded-io"]
+# FreeRTOS-flavoured API names (xTaskCreate, xQueueSend, ...) for porting existing code.
+freertos-compat = []
+# Network core: packet buffers, NetDevice contract, net task, hooks, NetRings.
+net = []
+# IPv4/TCP/UDP/ICMP via smoltcp plus the socket API.
+net-ip = ["net", "dep:smoltcp"]
+# Static packet-filter engine (RuleSet + ConnTrack) with iptables/pf-style builders.
+net-filter = ["net"]
+# Entropy/CSPRNG and the keystore (security domains themselves are always built).
+# Uses only vetted RustCrypto primitives.
+crypto = ["dep:chacha20", "dep:sha2", "dep:hkdf", "dep:hmac", "dep:chacha20poly1305", "dep:zeroize", "dep:rand_core"]
+# Container bundles (named/versioned/supervisable workloads) built on security domains.
+containers = []
+# Edge-compute building blocks: fixed-point DSP stages, pipelines, pub/sub topics.
+edge = []
+# Select the AArch32 Cortex-A port (ARMv7-A / ARMv6, e.g. Raspberry Pi 1/2/Zero) instead of
+# the default ARMv7-M Cortex-M port. Both are `target_arch = "arm"`, so A-profile boards set
+# this to disambiguate. No effect on non-ARM targets.
+cortex-a = []
+# The ARMv6 variant of the Cortex-A port (ARM1176, e.g. Raspberry Pi 1 / Zero / Zero W):
+# no generic timer (BCM system timer instead), no local controller (legacy ARMCTRL), no HYP
+# mode. Implies `cortex-a`. Needs a custom target built with nightly `-Zbuild-std`.
+armv6 = ["cortex-a"]
+# Filesystems: the VFS and RAM FS over the block device class (littlefs and FAT planned).
+fs = []
+# System power-state orchestration (sleep / suspend / resume, ACPI on x86 planned).
+power = []
+# Dynamic extension framework: runtime load/unload of compiled-in drivers/filesystems/etc.
+extensions = []
+# Interactive serial shell: a line-edited console with built-in commands (a small control
+# plane for containers, uptime, etc.) over any registered character device.
+shell = []
+# Trusted platform: TPM/secure-element root of trust, measured boot, sealing, attestation.
+tpm = ["crypto"]
+
+[dependencies]
+embedded-hal = { version = "1.0.0", optional = true }
+embedded-io = { version = "0.7.1", optional = true }
+# Vetted cryptography (RustCrypto; no hand-rolled primitives).
+chacha20 = { version = "0.9.1", optional = true, default-features = false, features = ["zeroize"] }
+sha2 = { version = "0.10.8", optional = true, default-features = false }
+hkdf = { version = "0.12.4", optional = true, default-features = false }
+hmac = { version = "0.12.1", optional = true, default-features = false }
+chacha20poly1305 = { version = "0.10.1", optional = true, default-features = false }
+zeroize = { version = "1.8", optional = true, default-features = false, features = ["zeroize_derive"] }
+rand_core = { version = "0.6.4", optional = true, default-features = false }
+smoltcp = { version = "0.14.0", optional = true, default-features = false, features = [
+    "medium-ethernet", "proto-ipv4", "socket-udp", "socket-tcp", "socket-icmp",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true

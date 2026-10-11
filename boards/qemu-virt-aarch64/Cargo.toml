@@ -1,0 +1,32 @@
+[package]
+name = "bismuth-board-qemu-virt-aarch64"
+version = "0.1.0"
+edition = "2024"
+description = "Bismuth boot board for QEMU aarch64 'virt' (Cortex-A, the first application-class ARM port)"
+publish = false
+
+# Standalone: built for aarch64-unknown-none-softfloat, independent of the kernel's host workspace.
+[workspace]
+
+[[bin]]
+name = "bismuth-aarch64"
+path = "src/main.rs"
+
+[dependencies]
+# Soft-float kernel (matches the x86 decision): the context switch saves only GPRs, no NEON.
+# No crypto/tpm (RustCrypto needs SIMD); EL0 NEON is a later, lazy-save addition.
+bismuth-kernel = { path = "../..", default-features = false, features = ["edge", "fs", "power", "extensions", "posix", "net", "containers", "shell"] }
+
+[features]
+# When set, the board drops into the interactive serial shell after the demo instead of
+# exiting QEMU. Build/run with `cargo run --features interactive`.
+interactive = []
+
+[profile.dev]
+panic = "abort"
+opt-level = "s"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
