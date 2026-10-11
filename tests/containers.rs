@@ -466,3 +466,40 @@ fn signed_bundle_admission_enforces_signature_ceiling_and_rollback() {
     Slot::new(0b1111, 6, Rights::READ, key).sign(&mut h, code); // signed with a different key
     assert_eq!(slot.admit(&h, code), Err(Reject::BadSignature));
 }
+
+#[test]
+fn placing_a_bundle_copies_the_signed_code_into_an_executable_region() {
+    use bismuth::security::Rights;
+    use bismuth::security::bundle::{BundleHeader, CodeRegion, Reject, Slot};
+
+    let key = [0x7eu8; 32];
+    let code = b"position-independent bundle image bytes".as_slice();
+    let slot = Slot::new(0b1111, 6, Rights::READ, key);
+    let mut h = BundleHeader {
+        magic: 0,
+        abi: 0,
+        counter: 1,
+        req_syscalls: 0b0001,
+        req_priority: 3,
+        req_rights: Rights::READ,
+        code_hash: [0; 32],
+        signature: [0; 32],
+    };
+    slot.sign(&mut h, code);
+
+    // Placement copies the admitted bytes into the region and re-measures them in place.
+    static REGION: CodeRegion<64> = CodeRegion::new();
+    assert!(REGION.is_empty());
+    slot.place(&REGION, &h, code).unwrap();
+    assert_eq!(REGION.len(), code.len());
+    REGION.with_code(|placed| assert_eq!(placed, code));
+
+    // A region too small for the code is refused (and the floor did not advance).
+    static SMALL: CodeRegion<8> = CodeRegion::new();
+    assert_eq!(slot.place(&SMALL, &h, code), Err(Reject::Malformed));
+
+    // The counter advanced on the successful placement, so a replay is refused.
+    static R2: CodeRegion<64> = CodeRegion::new();
+    assert_eq!(slot.place(&R2, &h, code), Err(Reject::Rollback));
+    assert!(R2.is_empty(), "a rejected placement leaves the region empty");
+}

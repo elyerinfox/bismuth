@@ -145,6 +145,78 @@ impl Slot {
     }
 }
 
+/// A pre-reserved, aligned region a bundle's verified code is copied into (the **placement**
+/// step). Placement is the portable half: the admitted bytes are copied in and re-measured in
+/// place so a copy fault or a region reused across loads can never leave stale/forged code.
+/// Actually *executing* the placed bytes additionally needs a port that can map the region
+/// executable (W^X + instruction-cache maintenance) — the documented "hard tier".
+#[repr(C, align(16))]
+pub struct CodeRegion<const N: usize> {
+    bytes: IrqCell<[u8; N]>,
+    len: AtomicU32,
+}
+
+impl<const N: usize> Default for CodeRegion<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> CodeRegion<N> {
+    pub const fn new() -> Self {
+        CodeRegion { bytes: IrqCell::new([0; N]), len: AtomicU32::new(0) }
+    }
+
+    /// How many bytes of code are currently placed.
+    pub fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Run `f` over the placed code bytes (for measurement/attestation or a port's mapping step).
+    pub fn with_code<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        let n = self.len();
+        self.bytes.lock(|b| f(&b[..n]))
+    }
+
+    /// Clear the region (zeroing it), e.g. before reuse by another load.
+    pub fn clear(&self) {
+        self.bytes.lock(|b| b.fill(0));
+        self.len.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Slot {
+    /// Admit a bundle and **place** its code into `region`: the bytes are copied in and the copy
+    /// is re-measured against the header's `code_hash`, so what sits in executable memory is
+    /// exactly what was signed. The region must be at least `code.len()` bytes. On success the
+    /// anti-rollback floor advances (as in [`admit`](Self::admit)). Turning the placed region
+    /// into a running task is the port's executable-mapping step; see [`CodeRegion`].
+    pub fn place<const N: usize>(&self, region: &CodeRegion<N>, h: &BundleHeader, code: &[u8]) -> Result<(), Reject> {
+        if code.len() > N {
+            return Err(Reject::Malformed);
+        }
+        self.admit(h, code)?;
+        region.bytes.lock(|b| b[..code.len()].copy_from_slice(code));
+        region.len.store(code.len() as u32, Ordering::Relaxed);
+        // Re-measure the placed copy: guard against a bad copy or a region shared across loads.
+        let ok = region.with_code(|placed| {
+            let mut hasher = Sha256::new();
+            hasher.update(placed);
+            let d: [u8; 32] = hasher.finalize().into();
+            d == h.code_hash
+        });
+        if !ok {
+            region.clear();
+            return Err(Reject::BadMeasurement);
+        }
+        Ok(())
+    }
+}
+
 /// Verify a bundle and, if admitted, spawn its entry in the slot's domain confined to the
 /// requested capabilities. `entry`/`stack` stand for the bundle's (mapped) code on targets
 /// that can place it; the admission decision is the security-critical part. Trusted callers.
