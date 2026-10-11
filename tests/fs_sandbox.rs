@@ -7,6 +7,7 @@
 use std::sync::Mutex as StdMutex;
 
 use bismuth::fs::{self, NodeKind, OpenMode, RamFs};
+use bismuth::security::manifest::{self, DirGrantDecl, DomainDecl, Manifest};
 use bismuth::security::{self, BadHandlePolicy, DomainSpec, Rights};
 use bismuth::{UserStack2K, sim, task, user};
 
@@ -96,5 +97,55 @@ fn sandboxed_task_uses_files_through_capabilities() {
             "write via rw-cap: Ok(7)".into(),
             "reread: Ok(\"PATCHED\")".into(),
         ]
+    );
+}
+
+static FS2: RamFs<32, 64, 64> = RamFs::new();
+static US2: UserStack2K = UserStack2K::new();
+
+// A manifest with a declarative directory grant (the `dirs` field), validated at compile time.
+static MANIFEST: Manifest = Manifest {
+    domains: &[DomainDecl {
+        spec: DomainSpec::sandboxed("declapp", 6, 1),
+        grants: &[],
+        dirs: &[DirGrantDecl { path: "/data", name: "data", rights: Rights::READ }],
+    }],
+};
+const _: () = manifest::validate(&MANIFEST);
+
+extern "C-unwind" fn declarative_app(_: usize) {
+    // The directory cap named in the manifest resolves without any imperative grant_dir call.
+    let d = user::fs_diropen("data").unwrap();
+    let f = user::fs_open(d, "report.txt", READ).unwrap();
+    let mut buf = [0u8; 16];
+    let n = user::fs_read(f, &mut buf).unwrap();
+    note(format!("declarative read: {:?}", core::str::from_utf8(&buf[..n])));
+    // The grant is read-only: opening for write is refused.
+    note(format!("declarative write: {:?}", user::fs_open(d, "report.txt", RDWR).err()));
+    user::fs_close(f).unwrap();
+}
+
+#[test]
+fn a_manifest_directory_grant_is_applied_declaratively() {
+    let _s = serial();
+    take();
+    FS2.format();
+    sim::run_to_completion(|| {
+        fs::mount("/", &FS2).unwrap();
+        fs::mkdir("/data").unwrap();
+        let seed = fs::open("/data/report.txt", OpenMode::RDWR.with(OpenMode::CREATE)).unwrap();
+        fs::write(seed, b"metrics").unwrap();
+        fs::close(seed);
+
+        // `apply` creates the domain and its directory capability straight from the manifest.
+        let ids = manifest::apply(&MANIFEST).unwrap();
+        let d = ids[0].unwrap();
+        security::seal().unwrap();
+
+        task::Builder::new("declapp").priority(4).domain(d).stack(&US2).spawn_user(declarative_app, 0).unwrap();
+    });
+    assert_eq!(
+        take(),
+        ["declarative read: Ok(\"metrics\")".to_string(), "declarative write: Some(PermissionDenied)".into()]
     );
 }

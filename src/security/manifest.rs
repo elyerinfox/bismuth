@@ -6,6 +6,7 @@
 //!     domains: &[DomainDecl {
 //!         spec: DomainSpec::isolated("telemetry", 8, 2),
 //!         grants: &[GrantDecl { device: "temp0", name: "temp0", rights: Rights::READ }],
+//!         dirs: &[DirGrantDecl { path: "/var/telemetry", name: "data", rights: Rights::READ }],
 //!     }],
 //! };
 //! const _: () = manifest::validate(&MANIFEST); // build fails on a policy violation
@@ -32,10 +33,24 @@ pub struct GrantDecl {
     pub rights: Rights,
 }
 
+/// A filesystem directory capability granted to a domain — the declarative form of
+/// [`fs::grant_dir`](crate::fs::grant_dir). The domain is confined to `path` and its subtree.
+#[derive(Copy, Clone, Debug)]
+pub struct DirGrantDecl {
+    /// Absolute path in the VFS that becomes the root of the granted subtree.
+    pub path: &'static str,
+    /// Name in the domain's namespace (what `fs_diropen("<name>")` resolves).
+    pub name: &'static str,
+    pub rights: Rights,
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct DomainDecl {
     pub spec: DomainSpec,
     pub grants: &'static [GrantDecl],
+    /// Declarative directory grants (empty `&[]` for none). Applied after device grants, so the
+    /// filesystem must be mounted by the time [`apply`] runs. Requires the `fs` feature.
+    pub dirs: &'static [DirGrantDecl],
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -93,6 +108,26 @@ pub const fn validate(m: &Manifest) {
             }
             k += 1;
         }
+        // Directory grants: non-empty rights, names unique within the domain's namespace
+        // (including against device-grant names, since both share `fs_diropen`/`open`).
+        let dirs = d[i].dirs;
+        let mut p = 0;
+        while p < dirs.len() {
+            assert!(!dirs[p].rights.contains(Rights::K_EXPORT), "manifest: K_EXPORT granted to an isolated domain");
+            assert!(!dirs[p].rights.contains(Rights::MANAGE), "manifest: MANAGE granted to an isolated domain");
+            assert!(dirs[p].rights.0 != 0, "manifest: empty directory grant");
+            let mut q = p + 1;
+            while q < dirs.len() {
+                assert!(!str_eq(dirs[p].name, dirs[q].name), "manifest: duplicate name in a domain namespace");
+                q += 1;
+            }
+            let mut r = 0;
+            while r < g.len() {
+                assert!(!str_eq(dirs[p].name, g[r].name), "manifest: directory grant name collides with a device grant");
+                r += 1;
+            }
+            p += 1;
+        }
         i += 1;
     }
     assert!(total_tasks + 4 <= MAX_TASKS, "manifest: task quotas exceed the task table");
@@ -107,6 +142,14 @@ pub fn apply(m: &Manifest) -> Result<[Option<DomainId>; MAX_DOMAINS], Error> {
         for g in decl.grants {
             let dev = Device::find(g.device)?;
             super::grant_device(id, dev, g.rights, g.name)?;
+        }
+        #[cfg(feature = "fs")]
+        for g in decl.dirs {
+            crate::fs::grant_dir(id, g.path, g.rights, g.name)?;
+        }
+        #[cfg(not(feature = "fs"))]
+        if !decl.dirs.is_empty() {
+            return Err(Error::Unsupported);
         }
         ids[i] = Some(id);
     }

@@ -44,6 +44,7 @@ static MANIFEST: ContainerManifest = ContainerManifest {
                 name: "sensor",
                 rights: Rights(Rights::READ.0 | Rights::CONTROL.0),
             }],
+            dirs: &[],
         },
         entry: ContainerEntry::user(telemetry, 5, &TELEM_STACK),
         version: 1,
@@ -101,7 +102,7 @@ static SENSOR2: SimSensor = SimSensor::new(1);
 static MANIFEST2: ContainerManifest = ContainerManifest {
     containers: &[
         ContainerDecl {
-            domain: DomainDecl { spec: DomainSpec::isolated("victim", 8, 1), grants: &[] },
+            domain: DomainDecl { spec: DomainSpec::isolated("victim", 8, 1), grants: &[], dirs: &[] },
             entry: ContainerEntry::privileged(idle_entry, 4, &OUTSIDER_STACK),
             version: 1,
             cpu: None,
@@ -113,6 +114,7 @@ static MANIFEST2: ContainerManifest = ContainerManifest {
             domain: DomainDecl {
                 spec: DomainSpec::isolated("worker", 8, 2),
                 grants: &[GrantDecl { device: "temp2", name: "s", rights: Rights::READ }],
+                dirs: &[],
             },
             entry: ContainerEntry::privileged(idle_entry, 4, &OUTSIDER2_STACK),
             version: 1,
@@ -189,7 +191,7 @@ extern "C-unwind" fn long_runner(_: usize) {
 static SUP_MANIFEST: ContainerManifest = ContainerManifest {
     containers: &[
         ContainerDecl {
-            domain: DomainDecl { spec: DomainSpec::sandboxed("worker", 8, 2), grants: &[] },
+            domain: DomainDecl { spec: DomainSpec::sandboxed("worker", 8, 2), grants: &[], dirs: &[] },
             entry: ContainerEntry::user(crasher, 5, &WK_STACK),
             version: 1,
             cpu: None,
@@ -198,7 +200,7 @@ static SUP_MANIFEST: ContainerManifest = ContainerManifest {
             image_hash: [0; 32],
         },
         ContainerDecl {
-            domain: DomainDecl { spec: DomainSpec::sandboxed("sibling", 8, 2), grants: &[] },
+            domain: DomainDecl { spec: DomainSpec::sandboxed("sibling", 8, 2), grants: &[], dirs: &[] },
             entry: ContainerEntry::user(long_runner, 4, &SIB_STACK),
             version: 1,
             cpu: None,
@@ -283,6 +285,7 @@ static IPC_MANIFEST: ContainerManifest = ContainerManifest {
             domain: DomainDecl {
                 spec: DomainSpec::sandboxed("consumer", 8, 2),
                 grants: &[GrantDecl { device: "ipcpipe", name: "ipc", rights: Rights(Rights::READ.0 | Rights::WRITE.0) }],
+                dirs: &[],
             },
             entry: ContainerEntry::user(consumer, 6, &CONS_STACK),
             version: 1,
@@ -295,6 +298,7 @@ static IPC_MANIFEST: ContainerManifest = ContainerManifest {
             domain: DomainDecl {
                 spec: DomainSpec::sandboxed("producer", 8, 2),
                 grants: &[GrantDecl { device: "ipcpipe", name: "ipc", rights: Rights(Rights::READ.0 | Rights::WRITE.0) }],
+                dirs: &[],
             },
             entry: ContainerEntry::user(producer, 5, &PROD_STACK),
             version: 1,
@@ -304,7 +308,7 @@ static IPC_MANIFEST: ContainerManifest = ContainerManifest {
             image_hash: [0; 32],
         },
         ContainerDecl {
-            domain: DomainDecl { spec: DomainSpec::sandboxed("ipc_outsider", 8, 2), grants: &[] },
+            domain: DomainDecl { spec: DomainSpec::sandboxed("ipc_outsider", 8, 2), grants: &[], dirs: &[] },
             entry: ContainerEntry::user(ipc_outsider, 4, &OUT_STACK),
             version: 1,
             cpu: None,
@@ -353,7 +357,7 @@ extern "C-unwind" fn partition_worker(_: usize) {
 
 static PART_MANIFEST: ContainerManifest = ContainerManifest {
     containers: &[ContainerDecl {
-        domain: DomainDecl { spec: DomainSpec::sandboxed("part", 8, 2), grants: &[] },
+        domain: DomainDecl { spec: DomainSpec::sandboxed("part", 8, 2), grants: &[], dirs: &[] },
         entry: ContainerEntry::user(partition_worker, 5, &PART_STACK),
         version: 1,
         cpu: None,

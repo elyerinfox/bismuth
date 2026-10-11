@@ -427,8 +427,9 @@ static TELEMETRY_MANIFEST: Manifest = Manifest {
         DomainDecl {
             spec: DomainSpec::isolated("telemetry", 8, 2),
             grants: &[GrantDecl { device: "temp9", name: "temp", rights: Rights(Rights::READ.0 | Rights::CONTROL.0) }],
+            dirs: &[],
         },
-        DomainDecl { spec: DomainSpec::isolated("ota", 6, 1), grants: &[] },
+        DomainDecl { spec: DomainSpec::isolated("ota", 6, 1), grants: &[], dirs: &[] },
     ],
 };
 // Policy violations in the manifest fail the *build*.
