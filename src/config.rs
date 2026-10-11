@@ -41,8 +41,17 @@ pub const MAX_LAYERS: usize = parse_or(option_env!("BISMUTH_MAX_LAYERS"), 6);
 pub const MAX_TIMERS: usize = parse_or(option_env!("BISMUTH_MAX_TIMERS"), 8);
 /// Number of stacks in the shared pool used by dynamically created threads (pthreads).
 pub const POOL_STACKS: usize = parse_or(option_env!("BISMUTH_POOL_STACKS"), 4);
-/// Size in bytes of each pooled stack.
-pub const POOL_STACK_SIZE: usize = parse_or(option_env!("BISMUTH_POOL_STACK_SIZE"), 2048);
+/// Size in bytes of each pooled stack (also the per–user-task **kernel** stack). It must hold a
+/// full exception frame plus a nested interrupt frame plus syscall-dispatch depth. Application-
+/// class cores (aarch64, x86-64, 32-bit Cortex-A) push large frames (e.g. aarch64's 272-byte
+/// context) and take a timer IRQ on top of a syscall, so they default to 4 KiB; the M-profile
+/// MCU, with small frames and little RAM, defaults to 2 KiB. Override with the env var.
+pub const POOL_STACK_SIZE: usize = parse_or(option_env!("BISMUTH_POOL_STACK_SIZE"), DEFAULT_POOL_STACK_SIZE);
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", all(target_arch = "arm", feature = "cortex-a")))]
+const DEFAULT_POOL_STACK_SIZE: usize = 4096;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", all(target_arch = "arm", feature = "cortex-a"))))]
+const DEFAULT_POOL_STACK_SIZE: usize = 2048;
 /// Size of the idle task's stack.
 pub const IDLE_STACK_SIZE: usize = parse_or(option_env!("BISMUTH_IDLE_STACK_SIZE"), 512);
 /// Size of the timer-service task's stack.
