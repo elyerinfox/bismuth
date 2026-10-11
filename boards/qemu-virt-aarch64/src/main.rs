@@ -8,6 +8,9 @@
 //! the kernel keeps running. Then it exits QEMU via semihosting.
 #![no_std]
 #![no_main]
+// In the `net-demo` build the EL0 isolation demo (its statics, worker/sandbox tasks and the
+// finisher) is the unused mode, and vice versa; the two are mutually exclusive top-level flows.
+#![cfg_attr(feature = "net-demo", allow(dead_code, unused_imports))]
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -146,58 +149,89 @@ fn virtio_blk_test() {
     kprintln!("virtio-blk: no device attached");
 }
 
-/// Scan the virtio-MMIO slots for a network device and do one real round-trip: broadcast an
-/// ARP request for the QEMU SLIRP gateway (10.0.2.2) and wait for its reply — exercising both
-/// the transmit and the receive virtqueues (verifies virtio-net when run with `-netdev user`).
-fn virtio_net_test() {
-    use bismuth::net::FrameDevice;
-    use bismuth::net::drivers::VirtioNet;
-    for i in 0..32u64 {
+/// The virtio-net NIC, wrapped in a software RX ring so the net core sees a full `NetDevice`.
+/// Const-constructed so it can live in a `static`; `probe` binds it to a transport slot at boot.
+#[cfg(feature = "net-demo")]
+static NIC: bismuth::net::SoftRing<bismuth::net::drivers::VirtioNet, 8> =
+    bismuth::net::SoftRing::new(bismuth::net::drivers::VirtioNet::new());
+
+/// Scan the virtio-MMIO slots for a network device, bring it up, register it with the net core,
+/// and give it a static IP (QEMU SLIRP: 10.0.2.15/24, gateway 10.0.2.2). Returns true if a NIC
+/// came up. The IP stack then runs over the real virtio-net device exactly as it does over the
+/// simulated `WireEnd` the host tests use.
+#[cfg(feature = "net-demo")]
+fn net_setup() -> bool {
+    use bismuth::net::ip::{self, IpConfig};
+    for i in 0..32usize {
         let base = 0x0a00_0000 + i * 0x200;
-        // SAFETY: a QEMU `virt` virtio-MMIO transport window.
-        let regs = unsafe { Mmio::new(base as usize, 0x200) };
-        let Ok(nic) = VirtioNet::probe(regs) else { continue };
-        let mac = nic.mac().0;
+        if NIC.inner().probe(base).is_err() {
+            continue;
+        }
+        let mac = NIC.inner().mac().0;
         kprintln!(
             "virtio-net: device at {base:#x}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
-        // Ethernet (14) + ARP (28). who-has 10.0.2.2, tell 10.0.2.15.
-        let mut f = [0u8; 42];
-        f[0..6].copy_from_slice(&[0xFF; 6]); // dst: broadcast
-        f[6..12].copy_from_slice(&mac); // src: us
-        f[12..14].copy_from_slice(&[0x08, 0x06]); // ethertype ARP
-        f[14..16].copy_from_slice(&[0x00, 0x01]); // htype Ethernet
-        f[16..18].copy_from_slice(&[0x08, 0x00]); // ptype IPv4
-        f[18] = 6; // hlen
-        f[19] = 4; // plen
-        f[20..22].copy_from_slice(&[0x00, 0x01]); // op request
-        f[22..28].copy_from_slice(&mac); // sender hw
-        f[28..32].copy_from_slice(&[10, 0, 2, 15]); // sender ip
-        // target hw = 0; target ip:
-        f[38..42].copy_from_slice(&[10, 0, 2, 2]);
-        if nic.send(&f).is_err() {
-            kprintln!("virtio-net: ARP transmit FAILED");
-            return;
-        }
-        let mut rx = [0u8; 1536];
-        for _ in 0..2_000_000 {
-            if let Some(n) = nic.recv(&mut rx) {
-                // An ARP reply (ethertype 0x0806, op 2) from the gateway.
-                if n >= 42 && rx[12] == 0x08 && rx[13] == 0x06 && rx[21] == 0x02 {
-                    kprintln!(
-                        "virtio-net: ARP reply from {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} — gateway 10.0.2.2 is at that MAC. OK",
-                        rx[22], rx[23], rx[24], rx[25], rx[26], rx[27]
-                    );
-                    return;
-                }
+        let idx = match bismuth::net::register("eth0", &NIC) {
+            Ok(i) => i,
+            Err(e) => {
+                kprintln!("virtio-net: register failed ({e:?})");
+                return false;
             }
-            core::hint::spin_loop();
+        };
+        let cfg = IpConfig { addr: [10, 0, 2, 15], prefix_len: 24, gateway: Some([10, 0, 2, 2]) };
+        if let Err(e) = ip::configure(idx, cfg) {
+            kprintln!("virtio-net: IP configure failed ({e:?})");
+            return false;
         }
-        kprintln!("virtio-net: no ARP reply (link may be unconfigured)");
-        return;
+        kprintln!("virtio-net: eth0 up, 10.0.2.15/24 gw 10.0.2.2");
+        return true;
     }
     kprintln!("virtio-net: no device attached");
+    false
+}
+
+/// Prove the IP stack end-to-end over the virtio-net NIC: a UDP DNS query to QEMU SLIRP's
+/// resolver (10.0.2.3:53). A reply exercises ARP + IPv4 + UDP in both directions on real
+/// hardware emulation. (If the host has no DNS the query still proves TX; we report either way.)
+#[cfg(feature = "net-demo")]
+fn net_demo() {
+    use bismuth::net::socket::UdpSocket;
+    use core::net::{Ipv4Addr, SocketAddrV4};
+    let sock = match UdpSocket::bind(0) {
+        Ok(s) => s,
+        Err(e) => {
+            kprintln!("virtio-net: UDP bind failed ({e:?})");
+            return;
+        }
+    };
+    // A minimal DNS A-record query for "example.com".
+    let query: [u8; 29] = [
+        0x12, 0x34, // id
+        0x01, 0x00, // flags: recursion desired
+        0x00, 0x01, // qdcount = 1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar = 0
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, // QNAME
+        0x00, 0x01, // QTYPE = A
+        0x00, 0x01, // QCLASS = IN
+    ];
+    let dst = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 3), 53);
+    if let Err(e) = sock.send_to(&query, dst) {
+        kprintln!("virtio-net: DNS send failed ({e:?})");
+        return;
+    }
+    let mut buf = [0u8; 512];
+    match sock.recv_from(&mut buf, Timeout::ms(4000)) {
+        Ok((n, from)) => kprintln!("virtio-net: DNS reply {n} bytes from {from} — IPv4/UDP over virtio-net OK"),
+        Err(e) => kprintln!("virtio-net: DNS query sent, no reply ({e:?}) — host resolver may be offline"),
+    }
+    // The UDP send had to ARP-resolve the resolver first, so a non-zero RX count proves the IP
+    // stack both transmits and receives over the virtio-net NIC (SLIRP's ARP reply was received).
+    if let Ok(idx) = bismuth::net::find("eth0") {
+        if let Ok(s) = bismuth::net::stats(idx) {
+            kprintln!("virtio-net: iface stats rx_packets={} tx_packets={}", s.rx_packets, s.tx_packets);
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -208,7 +242,34 @@ pub extern "C" fn kernel_main() -> ! {
     }
     bismuth::console::boot_logo();
     virtio_blk_test();
-    virtio_net_test();
+
+    // The networking demo is its own clean flow (`--features net-demo`): bring up the NIC and
+    // the IP stack, do one round-trip, exit. It is kept separate from the EL0 isolation demo
+    // below so each stays short and exits promptly.
+    #[cfg(feature = "net-demo")]
+    {
+        fn net_only(_: usize) {
+            net_demo();
+            bismuth::arch::aarch64::qemu_exit(0);
+        }
+        if net_setup() {
+            let _ = bismuth::net::start();
+        }
+        task::spawn("netdemo", 1, &SD, net_only, 0).unwrap();
+        bismuth::start(0);
+    }
+
+    #[cfg(not(feature = "net-demo"))]
+    {
+        el0_demo();
+        bismuth::start(0)
+    }
+}
+
+/// The EL0 user-isolation demo: two preempted workers, a sandboxed task, a rogue task that
+/// faults and is killed, then (interactive) the serial shell or (default) a clean exit.
+#[cfg(not(feature = "net-demo"))]
+fn el0_demo() {
     kprintln!("Bismuth {} on QEMU virt (aarch64 Cortex-A53) — stage 3: EL0 user tasks", env!("CARGO_PKG_VERSION"));
 
     let app_domain = security::create_domain(DomainSpec::sandboxed("app", 4, 1)).unwrap();
@@ -225,7 +286,6 @@ pub extern "C" fn kernel_main() -> ! {
     APP_DOMAIN.store(app_domain.0 as u32, Ordering::Relaxed);
     ROGUE_DOMAIN.store(rogue_domain.0 as u32, Ordering::Relaxed);
     task::spawn("done", 1, &SD, finisher, 0).unwrap();
-    bismuth::start(0)
 }
 
 #[panic_handler]

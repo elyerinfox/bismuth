@@ -112,22 +112,49 @@ static mut RXBUF: [[u8; BUF_CAP]; QSIZE] = [[0; BUF_CAP]; QSIZE];
 static mut TXBUF: [u8; BUF_CAP] = [0; BUF_CAP];
 
 struct Inner {
+    mac: [u8; 6],
+    ready: bool,
     rx_last_used: u16,
     rx_avail_idx: u16,
     tx_last_used: u16,
     tx_avail_idx: u16,
 }
 
+/// A virtio-net NIC. Const-constructible (so it can live in a `static` and be wrapped in a
+/// [`SoftRing`](crate::net::SoftRing) for [`net::register`](crate::net::register)); the MMIO
+/// window is bound and the device brought up by [`probe`](Self::probe) at boot.
 pub struct VirtioNet {
-    regs: Mmio,
-    mac: HwAddr,
+    base: core::sync::atomic::AtomicUsize,
     inner: IrqCell<Inner>,
 }
 
+impl Default for VirtioNet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VirtioNet {
-    /// Bind to a virtio-MMIO window and bring the NIC up. Fails if the slot is empty or not a
-    /// network device.
-    pub fn probe(regs: Mmio) -> Result<Self, Error> {
+    /// Create an unbound NIC (no MMIO window yet). Call [`probe`](Self::probe) at boot to bind
+    /// it to a transport slot and negotiate.
+    pub const fn new() -> Self {
+        VirtioNet {
+            base: core::sync::atomic::AtomicUsize::new(0),
+            inner: IrqCell::new(Inner { mac: [0; 6], ready: false, rx_last_used: 0, rx_avail_idx: 0, tx_last_used: 0, tx_avail_idx: 0 }),
+        }
+    }
+
+    /// The bound MMIO register window (valid once [`probe`](Self::probe) has set the base).
+    fn regs(&self) -> Mmio {
+        // SAFETY: `base` was validated as a virtio-MMIO window by `probe`.
+        unsafe { Mmio::new(self.base.load(Ordering::Relaxed), 0x200) }
+    }
+
+    /// Bind to a virtio-MMIO window at `base` and bring the NIC up. Fails if the slot is empty
+    /// or not a network device.
+    pub fn probe(&self, base: usize) -> Result<(), Error> {
+        self.base.store(base, Ordering::Relaxed);
+        let regs = self.regs();
         if regs.read32(MAGIC) != 0x7472_6976 || regs.read32(VERSION) != 2 || regs.read32(DEVICE_ID) != DEVICE_ID_NET {
             return Err(Error::NotReady);
         }
@@ -151,7 +178,7 @@ impl VirtioNet {
         // MAC address from the config space (6 bytes at offset 0).
         let m0 = regs.read32(CONFIG);
         let m1 = regs.read32(CONFIG + 4);
-        let mac = HwAddr([m0 as u8, (m0 >> 8) as u8, (m0 >> 16) as u8, (m0 >> 24) as u8, m1 as u8, (m1 >> 8) as u8]);
+        let mac = [m0 as u8, (m0 >> 8) as u8, (m0 >> 16) as u8, (m0 >> 24) as u8, m1 as u8, (m1 >> 8) as u8];
 
         // Queue 0 = receive, queue 1 = transmit.
         let rxvq = &raw const RXVQ;
@@ -178,16 +205,20 @@ impl VirtioNet {
         }
         regs.write32(QUEUE_NOTIFY, 0);
 
-        Ok(VirtioNet {
-            regs,
-            mac,
-            inner: IrqCell::new(Inner { rx_last_used: 0, rx_avail_idx: QSIZE as u16, tx_last_used: 0, tx_avail_idx: 0 }),
-        })
+        self.inner.lock(|st| {
+            st.mac = mac;
+            st.ready = true;
+            st.rx_last_used = 0;
+            st.rx_avail_idx = QSIZE as u16;
+            st.tx_last_used = 0;
+            st.tx_avail_idx = 0;
+        });
+        Ok(())
     }
 
-    /// The device's MAC address.
+    /// The device's MAC address (all zero until [`probe`](Self::probe) succeeds).
     pub fn mac(&self) -> HwAddr {
-        self.mac
+        HwAddr(self.inner.lock(|st| st.mac))
     }
 }
 
@@ -220,15 +251,18 @@ impl FrameDevice for VirtioNet {
     }
 
     fn hw_addr(&self) -> HwAddr {
-        self.mac
+        self.mac()
     }
 
     fn link(&self) -> LinkState {
-        LinkState::UP_100_FULL
+        if self.inner.lock(|st| st.ready) { LinkState::UP_100_FULL } else { LinkState::DOWN }
     }
 
     fn recv(&self, out: &mut [u8]) -> Option<usize> {
         self.inner.lock(|st| {
+            if !st.ready {
+                return None;
+            }
             // SAFETY: the device publishes completed RX buffers by advancing used.idx; an
             // Acquire fence after reading it orders their contents before our copy.
             let n = unsafe {
@@ -259,7 +293,7 @@ impl FrameDevice for VirtioNet {
                 st.rx_last_used = st.rx_last_used.wrapping_add(1);
                 n
             };
-            self.regs.write32(QUEUE_NOTIFY, 0);
+            self.regs().write32(QUEUE_NOTIFY, 0);
             Some(n)
         })
     }
@@ -269,6 +303,9 @@ impl FrameDevice for VirtioNet {
             return Err(Error::Invalid);
         }
         self.inner.lock(|st| {
+            if !st.ready {
+                return Err(Error::NotReady);
+            }
             // SAFETY: we exclusively own the TX arena inside this critical section; the device
             // only reads it between our notify and the used-index advance we poll for.
             unsafe {
@@ -288,7 +325,7 @@ impl FrameDevice for VirtioNet {
                 core::ptr::write_volatile(&raw mut (*tx).avail.idx, st.tx_avail_idx);
                 fence(Ordering::Release);
             }
-            self.regs.write32(QUEUE_NOTIFY, 1);
+            self.regs().write32(QUEUE_NOTIFY, 1);
             // Poll the transmit used ring for completion.
             let mut spins = 0u32;
             loop {
