@@ -396,6 +396,46 @@ pub fn cpu_used(c: ContainerId) -> u32 {
     crate::kernel::with(|k| k.domain_cpu_used(c.0.0))
 }
 
+/// One window of an ARINC-653 major frame: a partition (container) and the length of its slot.
+#[derive(Copy, Clone, Debug)]
+pub struct Window {
+    pub container: ContainerId,
+    /// Length of this partition's window, in scheduler ticks.
+    pub ticks: u32,
+}
+
+/// Run partitions as a repeating ARINC-653 **major frame** for `cycles` iterations (use
+/// [`run_major_frame`] for an endless module scheduler). Builds strict temporal partitioning on
+/// [`suspend`]/[`resume`]: every partition starts suspended, then each window in turn resumes its
+/// partition for `ticks`, sleeps, and suspends it again before the next window — so at any instant
+/// at most one partition's tasks are runnable. Call from a task whose priority is **above** every
+/// partition's ceiling, so it reliably reclaims the CPU at each window boundary. Trusted only.
+pub fn run_frames(frame: &[Window], cycles: usize) -> Result<(), Error> {
+    if !current_is_trusted() {
+        return Err(Error::PermissionDenied);
+    }
+    for w in frame {
+        suspend(w.container)?;
+    }
+    for _ in 0..cycles {
+        for w in frame {
+            resume(w.container)?;
+            crate::kernel::task::sleep_ticks(w.ticks as u64);
+            suspend(w.container)?;
+        }
+    }
+    Ok(())
+}
+
+/// The endless ARINC-653 module scheduler: cycle `frame`'s windows forever. Never returns.
+/// Trusted only (if the caller is not trusted it idles rather than running unpartitioned).
+pub fn run_major_frame(frame: &'static [Window]) -> ! {
+    let _ = run_frames(frame, usize::MAX);
+    loop {
+        crate::kernel::task::sleep_ticks(u32::MAX as u64);
+    }
+}
+
 /// Supervisor sweep (the kubelet analog): react to every container that should be running but
 /// is not, per its [`OnFault`] policy. The supervisor container calls this periodically (or
 /// the kernel does). Returns how many containers it acted on. Trusted callers only.
