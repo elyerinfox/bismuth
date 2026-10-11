@@ -50,6 +50,13 @@
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
+// The opt-in bounded heap (see `kernel::heap`) makes the `alloc` crate available to subsystems
+// that need it; the core kernel never uses it (so it may be unused until such a subsystem,
+// e.g. a Wasm container, is also enabled).
+#[cfg(feature = "heap")]
+#[allow(unused_extern_crates)]
+extern crate alloc;
+
 // ----- layer 0: ports -----
 pub mod arch;
 

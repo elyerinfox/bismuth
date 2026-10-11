@@ -52,6 +52,10 @@ extensions = []
 # Interactive serial shell: a line-edited console with built-in commands (a small control
 # plane for containers, uptime, etc.) over any registered character device.
 shell = []
+# A bounded, opt-in heap: a GlobalAlloc over a single fixed static arena (compile-time sized, so
+# total RAM stays static and allocation fails closed). OFF by default and outside the TCB; only
+# subsystems that genuinely need `alloc` (e.g. a Wasm container) pull it in.
+heap = ["dep:linked_list_allocator"]
 # Trusted platform: TPM/secure-element root of trust, measured boot, sealing, attestation.
 tpm = ["crypto"]
 
@@ -69,6 +73,8 @@ rand_core = { version = "0.6.4", optional = true, default-features = false }
 smoltcp = { version = "0.14.0", optional = true, default-features = false, features = [
     "medium-ethernet", "proto-ipv4", "socket-udp", "socket-tcp", "socket-icmp",
 ] }
+# A fixed-arena allocator (vetted, no_std) for the opt-in `heap` feature.
+linked_list_allocator = { version = "0.10.5", optional = true, default-features = false, features = ["use_spin"] }
 
 [profile.release]
 opt-level = "s"

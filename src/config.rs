@@ -154,3 +154,8 @@ pub const MAX_EXTENSIONS: usize = parse_or(option_env!("BISMUTH_MAX_EXTENSIONS")
 pub const TPM_PCRS: usize = parse_or(option_env!("BISMUTH_TPM_PCRS"), 8);
 /// Maximum plaintext bytes a single seal operation holds (e.g. a 32-byte root KEK).
 pub const TPM_SEAL_MAX: usize = parse_or(option_env!("BISMUTH_TPM_SEAL_MAX"), 64);
+
+/// Size in bytes of the single fixed heap arena (the `heap` feature). This is the heap's hard
+/// ceiling: it is reserved as one static region, so total RAM stays statically known and
+/// allocation fails closed once the arena is full. Default 256 KiB; set per board.
+pub const HEAP_SIZE: usize = parse_or(option_env!("BISMUTH_HEAP_SIZE"), 256 * 1024);

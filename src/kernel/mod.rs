@@ -9,6 +9,8 @@
 //! Classification: L1 kernel · scheduler core · safe · always
 
 pub mod cell;
+#[cfg(feature = "heap")]
+pub mod heap;
 pub mod idle;
 pub mod mem;
 pub(crate) mod stack;

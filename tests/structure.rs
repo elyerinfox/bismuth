@@ -12,6 +12,7 @@ const TCB: &[&str] = &[
     "src/arch/cortex_m.rs",
     "src/arch/mmio.rs",
     "src/kernel/cell.rs",
+    "src/kernel/heap.rs",
     "src/kernel/stack.rs",
     "src/kernel/usermem.rs",
     // The virtio-blk driver does DMA (shared rings + bounce buffer), so it is TCB like the
