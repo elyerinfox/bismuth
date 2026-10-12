@@ -8,9 +8,10 @@
 //! the kernel keeps running. Then it exits QEMU via semihosting.
 #![no_std]
 #![no_main]
-// In the `net-demo` build the EL0 isolation demo (its statics, worker/sandbox tasks and the
-// finisher) is the unused mode, and vice versa; the two are mutually exclusive top-level flows.
-#![cfg_attr(feature = "net-demo", allow(dead_code, unused_imports))]
+// The board has three mutually exclusive top-level flows — the default EL0 isolation demo, the
+// `net-demo` networking flow, and the `interactive` container host + shell — so whichever is not
+// selected is legitimately unused in that build.
+#![cfg_attr(any(feature = "net-demo", feature = "interactive"), allow(dead_code, unused_imports))]
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -96,12 +97,6 @@ fn finisher(_: usize) {
     kprintln!("rogue:   killed={} faults={}", security::is_killed(rogue_domain), security::faults(rogue_domain));
     if app_ok && rogue_killed {
         kprintln!("aarch64 EL0 demo complete: preemption, sandboxed syscalls, and fault-kills-domain verified. PASS");
-        #[cfg(feature = "interactive")]
-        {
-            // Hand the console to the interactive shell instead of exiting.
-            let _ = bismuth::shell::run("uart0");
-        }
-        #[cfg(not(feature = "interactive"))]
         bismuth::arch::aarch64::qemu_exit(0);
     } else {
         kprintln!("aarch64 EL0 demo FAILED (app_ok={app_ok} rogue_killed={rogue_killed})");
@@ -234,6 +229,66 @@ fn net_demo() {
     }
 }
 
+// ---- Interactive container host (`--features interactive`): install a real container and drop
+// into the shell, so `con ls` / `con start` / `con status` drive a hardware-isolated (EL0)
+// workload on QEMU through the full path — domain + capability grant + cgroups + namespaces.
+#[cfg(feature = "interactive")]
+static WEBAPP_STACK: UserStack2K = UserStack2K::new();
+
+/// A sandboxed (EL0) container workload: read its granted sensor, then serve indefinitely.
+#[cfg(feature = "interactive")]
+extern "C-unwind" fn webapp(_: usize) {
+    user::log(b"[webapp] started in EL0 sandbox\n");
+    if let Ok(h) = user::open("env") {
+        let mut raw = [0u8; 4];
+        let _ = user::read(h, &mut raw, Timeout::Forever);
+        user::log(b"[webapp] read granted sensor; serving\n");
+    }
+    loop {
+        user::sleep_ticks(50);
+    }
+}
+
+#[cfg(feature = "interactive")]
+static WEBAPP_MANIFEST: bismuth::security::container::ContainerManifest = {
+    use bismuth::security::container::{ContainerDecl, ContainerEntry, ContainerManifest, CpuBudget, OnFault};
+    use bismuth::security::manifest::{DomainDecl, GrantDecl};
+    ContainerManifest {
+        containers: &[ContainerDecl {
+            domain: DomainDecl {
+                spec: DomainSpec::sandboxed("webapp", 4, 1),
+                grants: &[GrantDecl { device: "sensor0", name: "env", rights: Rights::READ }],
+                dirs: &[],
+            },
+            entry: ContainerEntry::user(webapp, 3, &WEBAPP_STACK),
+            version: 1,
+            cpu: Some(CpuBudget { period_ms: 100, micros: 50_000, partitioned: false }),
+            ram_bytes: 4096,
+            on_fault: OnFault::Restart { max: 3, window_ms: 1000 },
+            image_hash: [0; 32],
+        }],
+        supervisor: None,
+    }
+};
+
+#[cfg(feature = "interactive")]
+fn shell_task(_: usize) {
+    let _ = bismuth::shell::run("uart0");
+}
+
+/// Install the demo container and hand the console to the shell.
+#[cfg(feature = "interactive")]
+fn container_host() {
+    use bismuth::security::container;
+    driver::register("sensor0", &SENSOR).expect("register sensor");
+    container::install(&WEBAPP_MANIFEST).expect("install container");
+    if let Some(c) = container::find("webapp") {
+        let _ = container::set_hostname(c, "web-01");
+    }
+    kprintln!("Bismuth container host ready. Try: con ls | con start webapp | con status webapp");
+    task::spawn("sh", 2, &SD, shell_task, 0).unwrap();
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main() -> ! {
     driver::probe_all(&BOARD, FACTORIES);
@@ -259,7 +314,13 @@ pub extern "C" fn kernel_main() -> ! {
         bismuth::start(0);
     }
 
-    #[cfg(not(feature = "net-demo"))]
+    // Interactive build hosts a real container + shell; otherwise the EL0 isolation demo.
+    #[cfg(all(not(feature = "net-demo"), feature = "interactive"))]
+    {
+        container_host();
+        bismuth::start(0)
+    }
+    #[cfg(all(not(feature = "net-demo"), not(feature = "interactive")))]
     {
         el0_demo();
         bismuth::start(0)
