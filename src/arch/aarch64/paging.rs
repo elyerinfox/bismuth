@@ -22,7 +22,9 @@
 #![allow(unsafe_code)]
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+use crate::kernel::cell::IrqCell;
 
 const PAGE: u64 = 4096;
 const BLOCK_2M: u64 = 2 * 1024 * 1024;
@@ -58,6 +60,37 @@ const L3_COUNT: usize = 16;
 static mut L3: [Table; L3_COUNT] = [const { Table([0; 512]) }; L3_COUNT];
 
 static READY: AtomicBool = AtomicBool::new(false);
+
+// ---- Per-domain EL0 ownership -------------------------------------------------------------
+//
+// The kernel image's text/rodata are shared EL0-RO(-X) for every domain, but a task's own
+// EL0 pages (its stack, or a loaded Linux process's buffer) belong to ONE security domain.
+// We record each opened range + its owner here, and on every context switch promote only the
+// incoming domain's ranges to EL0 while demoting the outgoing domain's to EL1-only. So two
+// EL0 domains can be live at once (e.g. concurrent Linux containers) without either being able
+// to read or write the other's memory — the stage-1 analog of per-domain `TTBR0`, done by
+// flipping `AP` bits in the single shared table (cheaper than per-domain tables for our scale).
+
+/// Sentinel meaning "no EL0 domain is currently promoted" (matches `kernel::NIL`).
+const NO_DOMAIN: u8 = u8::MAX;
+/// Maximum number of distinct owned EL0 ranges (per-task stacks + Linux code/data regions).
+const MAX_OWNED: usize = 24;
+
+#[derive(Copy, Clone)]
+struct Owned {
+    start: u64,
+    len: u64,
+    domain: u8,
+    /// `true` → promote as EL0 read + execute (loaded code); `false` → EL0 read-write (stack/data).
+    exec: bool,
+    used: bool,
+}
+
+const EMPTY_OWNED: Owned = Owned { start: 0, len: 0, domain: NO_DOMAIN, exec: false, used: false };
+
+static OWNED: IrqCell<[Owned; MAX_OWNED]> = IrqCell::new([EMPTY_OWNED; MAX_OWNED]);
+/// The domain whose EL0 ranges are currently promoted (so a switch to the same domain is a no-op).
+static CURRENT_EL0: AtomicU8 = AtomicU8::new(NO_DOMAIN);
 
 unsafe extern "C" {
     static __image_start: u8;
@@ -237,9 +270,9 @@ fn flush_tlb() {
     }
 }
 
-/// Open a running task's own stack to EL0 (RW, no exec). Returns whether every page was a
-/// mapped 4 KiB page that could be opened (fails closed otherwise).
-pub fn open_user_range(start: u64, len: u64) -> bool {
+/// Set every 4 KiB page in `[start, start+len)` to `ap`, with EL0 execute per `exec_el0` (EL1
+/// never executes user pages). Returns whether every page was a mapped 4 KiB page. Does not flush.
+fn set_pages(start: u64, len: u64, ap: u64, exec_el0: bool) -> bool {
     let mut v = start & !(PAGE - 1);
     let end = start + len;
     let mut ok = true;
@@ -248,39 +281,112 @@ pub fn open_user_range(start: u64, len: u64) -> bool {
             Some(e) => {
                 // SAFETY: `e` is a level-3 entry in our tables.
                 let d = unsafe { e.read_volatile() };
-                let na = (d & !(0b11 << 6) & !UXN & !PXN) | AP_EL0_RW | UXN | PXN;
+                let mut na = (d & !(0b11 << 6) & !UXN & !PXN) | ap | PXN; // EL1 never executes
+                if !exec_el0 {
+                    na |= UXN;
+                }
                 unsafe { e.write_volatile(na) };
             }
             None => ok = false,
         }
         v += PAGE;
     }
-    flush_tlb();
     ok
 }
 
-/// Open a range as EL0 **read + execute** (`AP = 11`, `UXN = 0`, `PXN = 1`) — for a loaded
-/// program's code placed in a kernel-image `.bss` buffer (the Linux-ABI / native-bundle loader).
-/// The region must already hold the code (written while it was EL1-RW). Fails closed off-image.
-#[cfg(feature = "linux-abi")]
-pub fn open_user_exec(start: u64, len: u64) -> bool {
-    let mut v = start & !(PAGE - 1);
-    let end = start + len;
-    let mut ok = true;
-    while v < end {
-        match l3_entry(v) {
-            Some(e) => {
-                // SAFETY: `e` is a level-3 entry in our tables.
-                let d = unsafe { e.read_volatile() };
-                let na = (d & !(0b11 << 6) & !UXN & !PXN) | AP_EL0_RO | PXN; // EL0 RO+exec, EL1 no-exec
-                unsafe { e.write_volatile(na) };
-            }
-            None => ok = false,
+/// Promote one owned range to its owner-visible EL0 permissions.
+fn promote(o: &Owned) {
+    if o.exec {
+        set_pages(o.start, o.len, AP_EL0_RO, true); // EL0 read + execute (loaded code)
+    } else {
+        set_pages(o.start, o.len, AP_EL0_RW, false); // EL0 read-write (stack/data)
+    }
+}
+
+/// Demote one owned range to EL1-only RW (invisible + inaccessible to EL0).
+fn demote(o: &Owned) {
+    set_pages(o.start, o.len, AP_EL1_RW, false);
+}
+
+/// Record an owned EL0 range for `domain` (replacing any existing record for the same start),
+/// and set its pages now: promoted if its domain is the one currently running at EL0, otherwise
+/// demoted (it becomes visible only when the scheduler switches that domain in).
+fn record(start: u64, len: u64, domain: u8, exec: bool) {
+    let o = Owned { start, len, domain, exec, used: true };
+    OWNED.lock(|t| {
+        // Reuse a slot with the same start, else the first free slot.
+        let slot = t.iter().position(|e| e.used && e.start == start).or_else(|| t.iter().position(|e| !e.used));
+        if let Some(i) = slot {
+            t[i] = o;
         }
-        v += PAGE;
+    });
+    if domain == CURRENT_EL0.load(Ordering::Relaxed) {
+        promote(&o);
+    } else {
+        demote(&o);
     }
     flush_tlb();
+}
+
+/// Open a task's own stack to EL0 read-write, owned by `domain`. Returns whether every page was
+/// a mapped 4 KiB page (fails closed otherwise).
+pub fn open_user_range(start: u64, len: u64, domain: u8) -> bool {
+    let ok = l3_entry(start).is_some() && l3_entry(start + len - 1).is_some();
+    record(start, len, domain, false);
     ok
+}
+
+/// Open a range as EL0 **read + execute**, owned by `domain` — a loaded program's code placed in
+/// a kernel-image `.bss` buffer (the Linux-ABI loader). The region must already hold the code
+/// (written while EL1-RW). Fails closed off-image.
+#[cfg(feature = "linux-abi")]
+pub fn open_user_exec(start: u64, len: u64, domain: u8) -> bool {
+    let ok = l3_entry(start).is_some() && l3_entry(start + len - 1).is_some();
+    record(start, len, domain, true);
+    ok
+}
+
+/// Release every owned range overlapping `[start, start+len)` and reset those pages to EL1-only
+/// RW — so the kernel can rewrite the buffer (the Linux loader's wipe/copy) and a reused buffer
+/// slot drops its previous owner. Fails-open (no-op) off-image.
+#[cfg(feature = "linux-abi")]
+pub fn release_el0_range(start: u64, len: u64) {
+    let end = start + len;
+    OWNED.lock(|t| {
+        for e in t.iter_mut() {
+            if e.used && e.start < end && e.start + e.len > start {
+                *e = EMPTY_OWNED;
+            }
+        }
+    });
+    set_pages(start, len, AP_EL1_RW, false);
+    flush_tlb();
+}
+
+/// Switch the promoted EL0 domain to `next` on a context switch: demote the outgoing domain's
+/// ranges and promote the incoming domain's, so only `next`'s EL0 memory is reachable from EL0.
+/// A no-op when the domain is unchanged. Called from the aarch64 context-switch path with the
+/// kernel lock held.
+pub fn switch_el0(next: u8) {
+    let prev = CURRENT_EL0.load(Ordering::Relaxed);
+    if prev == next {
+        return;
+    }
+    OWNED.lock(|t| {
+        for e in t.iter() {
+            if !e.used {
+                continue;
+            }
+            if e.domain == prev {
+                demote(e);
+            }
+            if e.domain == next {
+                promote(e);
+            }
+        }
+    });
+    CURRENT_EL0.store(next, Ordering::Relaxed);
+    flush_tlb();
 }
 
 /// Whether every page in `[addr, end)` is EL0 **read-only** (`AP = 11`) — kernel text/rodata,

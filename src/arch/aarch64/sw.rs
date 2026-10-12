@@ -161,16 +161,17 @@ pub(super) fn init_task(k: &mut Kernel, i: u8) {
             // A loaded Linux executable enters at its ELF entry with its own SysV stack (both in
             // the EL0-exec image buffer, opened by the loader); a native EL0 task enters its Rust
             // entry with its own pool stack opened to EL0 here.
+            let dom = t.domain;
             #[cfg(feature = "linux-abi")]
             let (entry_pc, sp_el0) = if t.is_linux {
                 (t.linux_entry as u64, t.linux_sp as u64)
             } else {
-                super::paging::open_user_range(ubase, ulen);
+                super::paging::open_user_range(ubase, ulen, dom);
                 (entry as *const () as u64, utop)
             };
             #[cfg(not(feature = "linux-abi"))]
             let (entry_pc, sp_el0) = {
-                super::paging::open_user_range(ubase, ulen);
+                super::paging::open_user_range(ubase, ulen, dom);
                 (entry as *const () as u64, utop)
             };
             let sp = kstack_top - 272;

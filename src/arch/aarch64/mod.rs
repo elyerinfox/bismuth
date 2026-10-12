@@ -74,6 +74,9 @@ pub fn request_switch() {
 /// The incoming task's saved stack pointer (stage 3 will also publish its kernel stack as
 /// `SP_EL1` and its address space before `ERET`ing to EL0).
 fn enter(k: &mut Kernel, n: u8) -> u64 {
+    // Flip EL0 page ownership to the incoming task's domain so it can reach only its own
+    // (and the shared kernel-text) EL0 memory — per-domain isolation in the single table.
+    paging::switch_el0(k.tasks[n as usize].domain);
     k.tasks[n as usize].sp as u64
 }
 
@@ -137,14 +140,22 @@ pub fn supports_user_tasks() -> bool {
     paging::ready()
 }
 
-/// Open a loaded Linux image's EL0 pages: its code region read-execute and its stack region
-/// read-write (both inside the kernel-image GiB buffer the `compat::linux` loader prepared).
-/// Returns whether every page was opened (fails closed otherwise).
+/// Open a loaded Linux image's EL0 pages for security domain `domain`: its code region
+/// read-execute and its stack/data region read-write (both inside the kernel-image GiB buffer the
+/// `compat::linux` loader prepared). The pages become EL0-reachable only while `domain` is the
+/// running EL0 domain. Returns whether every page was opened (fails closed otherwise).
 #[cfg(feature = "linux-abi")]
-pub fn open_linux_image(code: (u64, u64), stack: (u64, u64)) -> bool {
-    let a = paging::open_user_exec(code.0, code.1);
-    let b = paging::open_user_range(stack.0, stack.1);
+pub fn open_linux_image(code: (u64, u64), stack: (u64, u64), domain: u8) -> bool {
+    let a = paging::open_user_exec(code.0, code.1, domain);
+    let b = paging::open_user_range(stack.0, stack.1, domain);
     a && b
+}
+
+/// Drop any EL0 ownership of `[addr, addr+len)` and reset it to EL1-only RW so the loader can
+/// rewrite a (possibly reused) process buffer. See [`paging::release_el0_range`].
+#[cfg(feature = "linux-abi")]
+pub fn linux_reset_image(addr: u64, len: u64) {
+    paging::release_el0_range(addr, len);
 }
 
 /// Whether an unprivileged task may have the kernel read `[addr, end)` as read-only data:

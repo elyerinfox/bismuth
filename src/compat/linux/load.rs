@@ -39,7 +39,7 @@ enum Fd {
 const IMAGE_BYTES: usize = 128 * 1024;
 const PAGE: usize = 4096;
 /// How many Linux processes (one per domain) can be loaded at once.
-const MAX_PROCS: usize = 5;
+const MAX_PROCS: usize = 6;
 #[cfg(feature = "fs")]
 const MAX_FDS: usize = 8;
 #[cfg(feature = "fs")]
@@ -122,6 +122,13 @@ impl Proc {
 }
 
 static PROCS: IrqCell<[Proc; MAX_PROCS]> = IrqCell::new([Proc::EMPTY; MAX_PROCS]);
+
+/// The base address of the process buffer loaded for `domain`, if any — the vaddr of its first
+/// (code) page. Lets a supervisor point at one container's memory, e.g. to prove that another
+/// domain cannot reach it.
+pub fn proc_base(domain: u8) -> Option<u64> {
+    PROCS.lock(|p| p.iter().find(|x| x.used && x.domain == domain).map(|x| x.base))
+}
 
 /// The Linux syscall handler the port's `svc` gate reaches through [`linuxabi`]. It identifies the
 /// running process by the current security domain, then serves the call against that process's
@@ -270,10 +277,10 @@ pub fn load_and_run(bin: &[u8], name: &'static str, prio: u8, domain: DomainId) 
         }
     }
 
-    // A previous run may have left this buffer's code pages EL0 read-only (also EL1 read-only on
-    // this MMU); restore the whole buffer to read-write before we rewrite it.
+    // Drop any previous owner of this (possibly reused) buffer and reset it to EL1-only RW so the
+    // wipe/copy below can run (a prior run may have left code pages EL0-RO = also EL1-RO).
     let image_addr = IMAGES[i].lock(|img| img.0.as_ptr() as u64);
-    port::open_linux_image((image_addr, 0), (image_addr, IMAGE_BYTES as u64));
+    port::linux_reset_image(image_addr, IMAGE_BYTES as u64);
 
     // Copy each PT_LOAD segment to (vaddr - lo); zero-extend filesz..memsz (the wipe zeroes it).
     IMAGES[i].lock(|img| -> Result<(), Error> {
@@ -299,7 +306,7 @@ pub fn load_and_run(bin: &[u8], name: &'static str, prio: u8, domain: DomainId) 
     let exec_end = ((span + PAGE - 1) & !(PAGE - 1)) as u64;
     let rw_start = image_addr + exec_end;
     let rw_len = IMAGE_BYTES as u64 - exec_end;
-    if !port::open_linux_image((image_addr, span as u64), (rw_start, rw_len)) {
+    if !port::open_linux_image((image_addr, span as u64), (rw_start, rw_len), domain.0) {
         return Err(Error::Unsupported);
     }
 

@@ -249,9 +249,13 @@ pub fn supports_user_tasks() -> bool {
 
 /// Loading Linux images is not supported on this port (aarch64 EL0 only); fails closed.
 #[cfg(feature = "linux-abi")]
-pub fn open_linux_image(_code: (u64, u64), _stack: (u64, u64)) -> bool {
+pub fn open_linux_image(_code: (u64, u64), _stack: (u64, u64), _domain: u8) -> bool {
     false
 }
+
+/// Resetting a loaded image's pages is a no-op off the aarch64 port.
+#[cfg(feature = "linux-abi")]
+pub fn linux_reset_image(_addr: u64, _len: u64) {}
 
 fn mpu_present() -> bool {
     // SAFETY: MPU_TYPE is a read-only System Control Space register.

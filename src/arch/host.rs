@@ -341,9 +341,13 @@ pub fn supports_user_tasks() -> bool {
 /// Opening a loaded Linux image's EL0 pages is a no-op on the host simulator (isolation is
 /// enforced in the kernel, not by a page table); the loader's copy/stack logic is still exercised.
 #[cfg(feature = "linux-abi")]
-pub fn open_linux_image(_code: (u64, u64), _stack: (u64, u64)) -> bool {
+pub fn open_linux_image(_code: (u64, u64), _stack: (u64, u64), _domain: u8) -> bool {
     true
 }
+
+/// Resetting a loaded image's pages is a no-op off the aarch64 port.
+#[cfg(feature = "linux-abi")]
+pub fn linux_reset_image(_addr: u64, _len: u64) {}
 
 pub(crate) fn syscall(n: u32, args: [usize; 4]) -> isize {
     crate::security::syscall::dispatch(n, args)

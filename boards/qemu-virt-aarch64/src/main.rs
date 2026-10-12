@@ -33,6 +33,8 @@ mod linux_mmap;
 #[cfg(feature = "linux-demo")]
 mod linux_ls;
 #[cfg(feature = "linux-demo")]
+mod linux_rogue;
+#[cfg(feature = "linux-demo")]
 mod linux_spin;
 #[cfg(feature = "linux-demo")]
 mod linux_write;
@@ -416,6 +418,13 @@ static LXS3: Stack<8192> = Stack::new();
 static LXS4: Stack<8192> = Stack::new();
 #[cfg(feature = "linux-demo")]
 static LXS5: Stack<8192> = Stack::new();
+#[cfg(feature = "linux-demo")]
+static LXS6: Stack<8192> = Stack::new();
+
+/// A mutable copy of the rogue ELF whose target address the monitor patches (at `TADDR_OFF`) with
+/// another container's buffer base before launch.
+#[cfg(feature = "linux-demo")]
+static mut PATCHED_ROGUE: [u8; linux_rogue::ROGUE_ELF.len()] = linux_rogue::ROGUE_ELF;
 
 /// A container's root task: load its Linux binary and enter it at EL0 in this container's domain.
 /// The launcher returns once the EL0 task is spawned; the container lives until that task exits.
@@ -448,6 +457,17 @@ fn lx_write(_: usize) {
 #[cfg(feature = "linux-demo")]
 fn lx_ls(_: usize) {
     lx_launch(&linux_ls::LS_ELF, "ls");
+}
+#[cfg(feature = "linux-demo")]
+fn lx_rogue(_: usize) {
+    // Launch the monitor-patched rogue (reads another domain's buffer; expected to fault).
+    // SAFETY: the monitor fully wrote PATCHED_ROGUE before starting this container, and this is
+    // the only reader; no other task touches it concurrently.
+    let p = core::ptr::addr_of!(PATCHED_ROGUE) as *const u8;
+    let bin: &[u8] = unsafe { core::slice::from_raw_parts(p, linux_rogue::ROGUE_ELF.len()) };
+    if let Err(e) = bismuth::compat::linux::load::load_and_run(bin, "rogue", 2, security::current()) {
+        kprintln!("[rogue] load failed: {e:?}");
+    }
 }
 
 /// Three Linux binaries, each packaged as a container: an isolated domain (two task slots: the
@@ -519,6 +539,17 @@ static LINUX_MANIFEST: bismuth::security::container::ContainerManifest = {
                 on_fault: OnFault::Stop,
                 image_hash: [0; 32],
             },
+            // A rogue container: it reads another container's buffer to prove per-domain EL0
+            // isolation faults it. Started by the monitor (after its target address is patched in).
+            ContainerDecl {
+                domain: DomainDecl { spec: DomainSpec::isolated("lxrogue", 4, 2), grants: &[], dirs: &[] },
+                entry: ContainerEntry::privileged(lx_rogue, 3, &LXS6),
+                version: 1,
+                cpu: None,
+                ram_bytes: 131072,
+                on_fault: OnFault::Stop,
+                image_hash: [0; 32],
+            },
         ],
         supervisor: None,
     }
@@ -557,18 +588,13 @@ fn linux_demo() {
 fn linux_monitor(_: usize) {
     use bismuth::fs::{self, OpenMode};
     use bismuth::security::{self, container};
-    // The binaries are tiny; give them time to run and exit (each exit tears its domain down).
+    // Wait for the five workload containers to run their binaries to `exit` (each exit tears its
+    // domain down). The rogue container has not been started yet.
+    let workloads = ["lxspin", "lxcat", "lxmmap", "lxwrite", "lxls"];
     for _ in 0..80 {
         task::sleep_ticks(10);
-        let mut done = 0;
-        let mut total = 0;
-        container::for_each(|c, _| {
-            total += 1;
-            if security::is_killed(c.0) {
-                done += 1;
-            }
-        });
-        if done == total {
+        let done = workloads.iter().filter(|n| container::find(n).map(|c| security::is_killed(c.0)).unwrap_or(false)).count();
+        if done == workloads.len() {
             break;
         }
     }
@@ -593,7 +619,40 @@ fn linux_monitor(_: usize) {
         }
         fs::close(f);
     }
-    kprintln!("aarch64 Linux-container demo complete: five Linux binaries ran as containers — a CPU-bound spinner (cpu cgroup), a VFS reader (lseek), a heap allocator (mmap), a file writer, and a directory lister (getdents64) — with per-container cpu/memory cgroups. PASS");
+
+    // Per-domain EL0 isolation proof: point a rogue container at container 'lxls's buffer base and
+    // start it. 'lxls' ran in a different domain, so its pages are not EL0-reachable from the
+    // rogue — the read must abort and kill the rogue's domain (it never prints its "broken" line).
+    let target = container::find("lxls").and_then(|c| bismuth::compat::linux::load::proc_base(c.0.0));
+    if let Some(base) = target {
+        // SAFETY: single-threaded setup; the rogue container is not started until after this write.
+        unsafe {
+            let p = core::ptr::addr_of_mut!(PATCHED_ROGUE) as *mut u8;
+            let dst = core::slice::from_raw_parts_mut(p.add(linux_rogue::TADDR_OFF), 8);
+            dst.copy_from_slice(&base.to_le_bytes());
+        }
+        let rogue = container::find("lxrogue").unwrap();
+        kprintln!("[isolation] starting rogue; it will read lxls's page at {base:#x} (a foreign domain)");
+        container::start(rogue).unwrap();
+        let mut killed = false;
+        for _ in 0..80 {
+            task::sleep_ticks(10);
+            if security::is_killed(rogue.0) {
+                killed = true;
+                break;
+            }
+        }
+        if killed && security::faults(rogue.0) > 0 {
+            kprintln!("[isolation] rogue faulted reading a foreign domain's page and was killed (faults={}) — per-domain EL0 isolation VERIFIED", security::faults(rogue.0));
+        } else {
+            kprintln!("[isolation] FAILED: rogue was not killed (killed={killed}, faults={}) — isolation broken", security::faults(rogue.0));
+            bismuth::arch::aarch64::qemu_exit(1);
+        }
+    } else {
+        kprintln!("[isolation] could not resolve lxls base; skipping isolation proof");
+    }
+
+    kprintln!("aarch64 Linux-container demo complete: five workload containers (spinner+cpu-cgroup, VFS reader+lseek, mmap heap, file writer, getdents64 ls) ran with per-container cpu/memory cgroups, and a rogue container proved per-domain EL0 isolation. PASS");
     bismuth::arch::aarch64::qemu_exit(0);
 }
 
