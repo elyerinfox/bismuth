@@ -58,6 +58,9 @@ shell = []
 heap = ["dep:linked_list_allocator"]
 # A minimal WebAssembly interpreter (the C8 Wasm container). Needs a heap (alloc).
 wasm = ["heap"]
+# Linux-ABI personality (staged): ELF loading now, then EL0 image mapping + the Linux syscall
+# surface + process start — the path toward running Linux/OCI executables. OFF by default.
+linux-abi = []
 # Trusted platform: TPM/secure-element root of trust, measured boot, sealing, attestation.
 tpm = ["crypto"]
 

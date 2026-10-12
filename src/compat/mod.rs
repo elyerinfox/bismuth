@@ -13,5 +13,7 @@ pub mod errno;
 pub mod freertos;
 #[cfg(feature = "hal-compat")]
 pub mod hal;
+#[cfg(feature = "linux-abi")]
+pub mod linux;
 #[cfg(feature = "posix")]
 pub mod posix;
