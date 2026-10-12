@@ -709,10 +709,11 @@ impl Kernel {
         }
     }
 
-    /// Jump straight to `tick` (used by tickless idle and the virtual-time simulator). The
-    /// x86-64 and AArch32 Cortex-A ports keep their timer running during light sleep, so they
-    /// never need the jump (only the Cortex-M SysTick-suppression path and the host sim do).
-    #[cfg(any(not(target_os = "none"), all(target_arch = "arm", not(feature = "cortex-a"))))]
+    /// Jump straight to `tick` (used by tickless idle and the virtual-time simulator). The x86-64
+    /// and AArch32 Cortex-A ports keep their timer running during light sleep, so they never need
+    /// the jump; the Cortex-M SysTick-suppression path, the aarch64 generic-timer one-shot path,
+    /// and the host sim do.
+    #[cfg(any(not(target_os = "none"), all(target_arch = "arm", not(feature = "cortex-a")), target_arch = "aarch64"))]
     pub fn advance_to(&mut self, tick: u64) {
         if tick > self.tick {
             self.idle_ticks += tick - self.tick;

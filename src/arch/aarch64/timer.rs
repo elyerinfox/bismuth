@@ -49,3 +49,35 @@ pub fn init(tick_hz: u32) {
 pub fn rearm() {
     set_tval(INTERVAL.load(Ordering::Relaxed));
 }
+
+/// The free-running virtual count (never stops, even in `WFI`).
+fn cntvct() -> u64 {
+    let v: u64;
+    // SAFETY: reading the virtual counter is side-effect free.
+    unsafe { asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+fn set_cval(v: u64) {
+    // SAFETY: programming the virtual timer's 64-bit compare value (one-shot at an absolute count).
+    unsafe { asm!("msr cntv_cval_el0, {}", in(reg) v, options(nomem, nostack, preserves_flags)) };
+}
+
+/// Tickless: suppress intermediate periodic ticks by moving the comparator out to `naps` kernel
+/// ticks from now (one interrupt at the deadline instead of one per tick). Returns the virtual
+/// count at entry so the caller can reconcile elapsed time after `WFI`. The periodic cadence is
+/// restored automatically by the timer IRQ's [`rearm`]; [`elapsed_ticks`] reads how long we slept.
+pub fn arm_oneshot(naps: u64) -> u64 {
+    let interval = INTERVAL.load(Ordering::Relaxed).max(1);
+    let start = cntvct();
+    // Cap the horizon so the multiply cannot overflow and we re-evaluate at least periodically.
+    let units = naps.min(1 << 32).saturating_mul(interval);
+    set_cval(start.saturating_add(units));
+    start
+}
+
+/// Kernel ticks elapsed since `start` (the value [`arm_oneshot`] returned).
+pub fn elapsed_ticks(start: u64) -> u64 {
+    let interval = INTERVAL.load(Ordering::Relaxed).max(1);
+    cntvct().wrapping_sub(start) / interval
+}

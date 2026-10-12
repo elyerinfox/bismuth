@@ -98,9 +98,25 @@ pub(crate) fn idle() {
 
 /// Tickless light sleep. Until the generic-timer one-shot is wired in (stage 2 tickless), a
 /// plain `WFI`; the always-on generic timer wakes it, so no time is lost.
-pub(crate) fn sleep_until(_deadline: Option<u64>) {
-    // SAFETY: `wfi` only waits for an interrupt.
-    unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
+pub(crate) fn sleep_until(deadline: Option<u64>) {
+    match deadline {
+        // Tickless: program the generic timer for a single interrupt at the next event and sleep
+        // through the intermediate periodic ticks, reconciling the kernel clock from the
+        // free-running counter on wake (the timer IRQ restores the periodic cadence via `rearm`).
+        Some(d) => {
+            let now = kernel::time::ticks();
+            if d <= now {
+                return;
+            }
+            let start = timer::arm_oneshot(d - now);
+            // SAFETY: `wfi` only waits for an interrupt.
+            unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
+            let elapsed = timer::elapsed_ticks(start);
+            kernel::with(|k| k.advance_to(now + elapsed));
+        }
+        // SAFETY: `wfi` only waits for an interrupt.
+        None => unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) },
+    }
 }
 
 /// Lay out a fresh task's initial exception frame (see [`sw::init_task`]).
