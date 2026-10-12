@@ -14,3 +14,4 @@
 
 pub mod elf;
 pub mod stack;
+pub mod syscall;
