@@ -242,3 +242,27 @@ pub fn load(
         .spawn_user(entry, 0)
         .map(|_| ())
 }
+
+/// Admit a signed bundle whose code is **WebAssembly**, place it, and run an exported function in
+/// the in-tree interpreter ([`crate::wasm`]). This is the *sound* answer to C7's execution step on
+/// a safe-Rust / MMU-less kernel: externally-supplied, signature-verified, measured code runs as
+/// interpreted bytecode — no mapping of arbitrary native machine code into executable memory.
+/// Returns the entry function's `i32` result. Trusted callers.
+#[cfg(feature = "wasm")]
+pub fn run_wasm<const N: usize>(
+    slot: &Slot,
+    region: &CodeRegion<N>,
+    h: &BundleHeader,
+    code: &[u8],
+    entry: &str,
+    args: &[i32],
+) -> Result<Option<i32>, Error> {
+    if !super::current_is_trusted() {
+        return Err(Error::PermissionDenied);
+    }
+    slot.place(region, h, code).map_err(|_| Error::Integrity)?;
+    region.with_code(|placed| {
+        let module = crate::wasm::Module::parse(placed)?;
+        module.invoke(entry, args)
+    })
+}

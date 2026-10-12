@@ -467,6 +467,40 @@ fn signed_bundle_admission_enforces_signature_ceiling_and_rollback() {
     assert_eq!(slot.admit(&h, code), Err(Reject::BadSignature));
 }
 
+#[cfg(feature = "wasm")]
+#[test]
+fn a_signed_wasm_bundle_is_admitted_placed_and_interpreted() {
+    use bismuth::security::Rights;
+    use bismuth::security::bundle::{BundleHeader, CodeRegion, Slot};
+
+    // (module (func (export "add") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))
+    const ADD: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, 0x03,
+        0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, b'a', b'd', b'd', 0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20,
+        0x00, 0x20, 0x01, 0x6a, 0x0b,
+    ];
+    let key = [0x33u8; 32];
+    let slot = Slot::new(0b1, 6, Rights::READ, key);
+    let mut h = BundleHeader {
+        magic: 0,
+        abi: 0,
+        counter: 1,
+        req_syscalls: 0b1,
+        req_priority: 3,
+        req_rights: Rights::READ,
+        code_hash: [0; 32],
+        signature: [0; 32],
+    };
+    slot.sign(&mut h, ADD);
+    static REGION: CodeRegion<128> = CodeRegion::new();
+    // Verified + measured + placed, then interpreted — no native code mapping.
+    let r = bismuth::security::bundle::run_wasm(&slot, &REGION, &h, ADD, "add", &[2, 3]).unwrap();
+    assert_eq!(r, Some(5));
+
+    // A tampered counter (replay) is refused before anything runs.
+    assert!(bismuth::security::bundle::run_wasm(&slot, &REGION, &h, ADD, "add", &[2, 3]).is_err());
+}
+
 #[test]
 fn placing_a_bundle_copies_the_signed_code_into_an_executable_region() {
     use bismuth::security::Rights;
