@@ -83,13 +83,16 @@ const PSCI_NOT_SUPPORTED: i64 = -1;
 
 // ---- Stage 2: the guest's own guest-physical (IPA) address space ----
 //
-// The guest sees a 2 MiB RAM window at IPA `GUEST_IPA_BASE` (0x4000_0000, like a real `virt`
+// The guest sees a 64 MiB RAM window at IPA `GUEST_IPA_BASE` (0x4000_0000, like a real `virt`
 // board), which stage-2 translation maps to the host-physical [`GUEST_RAM`] arena. Nothing else
 // is mapped, so any guest access outside that window faults to EL2. The guest runs at its IPA
 // base with its stack at the top of the window; the hypervisor converts a guest pointer back to
-// a host address with [`gpa_to_hpa`] before touching it.
+// a host address with [`gpa_to_hpa`] before touching it. Stage 10 grew this from 2 MiB to a
+// realistic 64 MiB (room for a real kernel + initrd), mapped as 32 contiguous 2 MiB stage-2 blocks.
 const GUEST_IPA_BASE: u64 = 0x4000_0000;
-const GUEST_RAM_SIZE: u64 = 0x20_0000; // 2 MiB
+const GUEST_RAM_SIZE: u64 = 0x400_0000; // 64 MiB
+const S2_BLOCK: u64 = 0x20_0000; // 2 MiB stage-2 block
+const GUEST_RAM_BLOCKS: usize = (GUEST_RAM_SIZE / S2_BLOCK) as usize; // 32
 
 /// A 2 MiB-aligned host-physical arena backing the guest's RAM (the blob is copied in at offset 0,
 /// the guest runs there at EL1, and its stack lives at the top).
@@ -133,9 +136,12 @@ fn setup_stage2() {
             l1.add(i).write_volatile(0);
             l2.add(i).write_volatile(0);
         }
-        // L2[0] = 2 MiB block → arena. Lower attrs: valid(1) | MemAttr=0b1111 Normal-WB(<<2) |
-        // S2AP=0b11 RW(<<6) | SH=0b11 inner(<<8) | AF(<<10) = 0x7FD; XN=0 (executable).
-        l2.add(0).write_volatile(arena | 0x7FD);
+        // L2[0..GUEST_RAM_BLOCKS] = contiguous 2 MiB blocks → the arena. Lower attrs:
+        // valid(1) | MemAttr=0b1111 Normal-WB(<<2) | S2AP=0b11 RW(<<6) | SH=0b11 inner(<<8) |
+        // AF(<<10) = 0x7FD; XN=0 (executable). 32 blocks cover the 64 MiB guest RAM window.
+        for i in 0..GUEST_RAM_BLOCKS {
+            l2.add(i).write_volatile((arena + i as u64 * S2_BLOCK) | 0x7FD);
+        }
         // L1[1] = table descriptor → L2 (IPA 0x4000_0000 has level-1 index 1).
         l1.add(1).write_volatile((l2 as u64) | 0x3);
 
@@ -253,12 +259,57 @@ fn gich_enable() {
     write32(GICH + GICH_VMCR, 0xF800_0003); // VPMR=0x1F<<27 | VENG1 | VENG0
 }
 
-/// Inject a pending virtual interrupt into list register 0: the guest takes it through its GICV
-/// once it unmasks IRQs and enables its CPU interface. GICv2 LR layout: vINTID[9:0],
+/// Number of GICv2 hypervisor list registers to use (QEMU `virt` provides 4). Scanning several LRs
+/// lets independent virtual interrupts — the timer (INTID 27) and a virtio completion (32..34) —
+/// be pending at once instead of one clobbering the other's single list register.
+const GICH_LR_N: usize = 4;
+
+/// Inject a pending virtual interrupt into a free list register: the guest takes it through its
+/// GICV once it unmasks IRQs and enables its CPU interface. GICv2 LR layout: vINTID[9:0],
 /// priority[27:23]=0 (highest), State[29:28]=0b01 (pending), Grp1 (bit30=1 → delivered as a
 /// non-secure vIRQ, not a Group-0 vFIQ), HW=0 (software). The guest must enable Group 1 on GICV.
+/// Picks the first LR whose State is invalid (free); if all are busy, reuses LR0 (best effort).
 fn inject(vintid: u64) {
-    write32(GICH + GICH_LR0, (1 << 30) | (1 << 28) | (vintid as u32 & 0x3FF));
+    let lr = (1 << 30) | (1 << 28) | (vintid as u32 & 0x3FF);
+    for i in 0..GICH_LR_N {
+        let reg = GICH + GICH_LR0 + i * 4;
+        if (read32(reg) >> 28) & 0x3 == 0 {
+            write32(reg, lr);
+            return;
+        }
+    }
+    write32(GICH + GICH_LR0, lr);
+}
+
+/// Virtual interrupts a device backend has raised (a bitmask over vINTIDs 0..63) that are waiting
+/// to be injected. A virtio completion is serviced in the *synchronous* MMIO-trap path (the guest's
+/// `QueueNotify` store), but a list-register injection only reaches the guest's GICV reliably from
+/// the EL2 IRQ context — so the backend records the pending vINTID here and the EL2 timer IRQ
+/// handler (which already runs on a free-running cadence) drains and injects it. Latency is at most
+/// one timer period; the delivery is a genuine, GICD-gated virtual IRQ the guest waits on.
+static mut VIRQ_PENDING: u64 = 0;
+
+/// Record a device's completion interrupt to be injected from the next EL2 IRQ.
+fn raise_virq(vintid: u64) {
+    // SAFETY: single-threaded EL2 access to our own pending-interrupt bitmask.
+    unsafe { VIRQ_PENDING |= 1 << (vintid & 63) };
+}
+
+/// Drain the queued device completion interrupts, injecting each the guest has enabled in its GICD.
+/// Called from the EL2 IRQ handler so the list-register write happens in the context the vGIC
+/// presents reliably.
+fn drain_virqs() {
+    // SAFETY: single-threaded EL2 access to our own pending-interrupt bitmask.
+    let mut pending = unsafe { VIRQ_PENDING };
+    while pending != 0 {
+        let v = pending.trailing_zeros() as u64;
+        pending &= !(1 << v);
+        // SAFETY: clear the serviced bit.
+        unsafe { VIRQ_PENDING &= !(1 << v) };
+        if gicd_irq_enabled(v) {
+            inject(v);
+        }
+    }
 }
 
 // ---- Stage 9: emulated GICv2 distributor (GICD) ----
@@ -363,6 +414,10 @@ const DEV_BLK: usize = 1;
 const DEV_NET: usize = 2;
 // DeviceID per slot: console=3, block=2, network=1.
 const DEV_IDS: [u32; VIRTIO_NDEV] = [3, 2, 1];
+/// Stage 10: each virtio-mmio device is wired to a distinct GIC SPI, so a used-buffer completion
+/// raises a real interrupt. INTIDs 32/33/34 = SPI 0/1/2 (the `/virtio_mmio` DTB `interrupts` props
+/// advertise `<GIC_SPI, slot, level-high>`), letting the guest drive virtio by IRQ, not polling.
+const DEV_INTID: [u64; VIRTIO_NDEV] = [32, 33, 34];
 const VIRTIO_MAGIC: u32 = 0x7472_6976; // "virt"
 
 // virtqueue descriptor flags.
@@ -388,10 +443,13 @@ struct Vdev {
     status: u32,
     qsel: u32,
     qready: u32,
+    /// virtio-mmio InterruptStatus (bit0 = used-buffer notification), set when a queue completes
+    /// and cleared by the guest's InterruptACK write — the IRQ-driven handshake (Stage 10).
+    isr: u32,
     q: [Vq; 2],
 }
 impl Vdev {
-    const NEW: Vdev = Vdev { status: 0, qsel: 0, qready: 0, q: [Vq::NEW, Vq::NEW] };
+    const NEW: Vdev = Vdev { status: 0, qsel: 0, qready: 0, isr: 0, q: [Vq::NEW, Vq::NEW] };
 }
 static mut VDEVS: [Vdev; VIRTIO_NDEV] = [Vdev::NEW; VIRTIO_NDEV];
 
@@ -610,6 +668,9 @@ fn build_dtb(mem_base: u64, mem_size: u64) -> usize {
             f.begin(&name);
             f.prop_str(b"compatible", b"virtio,mmio");
             f.prop_cells(b"reg", &[hi(base), lo(base), 0, VIRTIO_STRIDE as u32]);
+            // Stage 10: GICv2 interrupt = <GIC_SPI(0), SPI slot = device index, level-high(4)>.
+            // SPI `i` is INTID 32+i, matching DEV_INTID — so the guest can wait on the device IRQ.
+            f.prop_cells(b"interrupts", &[0, i as u32, 4]);
             f.end();
         }
 
@@ -713,7 +774,7 @@ fn virtio_read(dev: usize, off: usize) -> u32 {
         0x010 => 0,              // DeviceFeatures (expose none — legacy-style handshake)
         0x034 => 8,              // QueueNumMax
         0x044 => d.qready,
-        0x060 => 0,              // InterruptStatus (polled; no IRQ)
+        0x060 => d.isr,          // InterruptStatus: bit0 = used-buffer notification (Stage 10)
         0x070 => d.status,
         0x0fc => 0,              // ConfigGeneration
         // Device-specific config space (0x100+):
@@ -736,6 +797,7 @@ fn virtio_write(dev: usize, off: usize, val: u32) {
         0x038 => {} // QueueNum (we use a fixed ring size)
         0x044 => d.qready = val,
         0x050 => notify(dev, val), // QueueNotify: `val` = the queue index the guest kicked
+        0x064 => d.isr &= !val,    // InterruptACK: clear the acknowledged InterruptStatus bits
         0x070 => d.status = val,   // 0 = device reset
         0x080 => d.q[qi].desc = (d.q[qi].desc & 0xffff_ffff_0000_0000) | val as u64,
         0x084 => d.q[qi].desc = (d.q[qi].desc & 0xffff_ffff) | ((val as u64) << 32),
@@ -747,7 +809,10 @@ fn virtio_write(dev: usize, off: usize, val: u32) {
     }
 }
 
-/// Route a `QueueNotify` to the right device backend.
+/// Route a `QueueNotify` to the right device backend, then raise the device's used-buffer
+/// completion interrupt (Stage 10): set InterruptStatus bit0 and inject the device's vINTID into
+/// the guest's vGIC — gated on the guest having enabled that INTID in the emulated distributor,
+/// exactly as real hardware gates an SPI. A guest that enabled the IRQ is woken instead of polling.
 fn notify(dev: usize, qidx: u32) {
     match dev {
         DEV_CONSOLE => console_drain(),
@@ -755,6 +820,10 @@ fn notify(dev: usize, qidx: u32) {
         DEV_NET => net_service(qidx),
         _ => {}
     }
+    // SAFETY: single-threaded EL2 access to our own device state.
+    unsafe { (*addr_of_mut!(VDEVS))[dev].isr |= 1 };
+    // Queue the completion interrupt; the EL2 timer IRQ handler injects it (see `drain_virqs`).
+    raise_virq(DEV_INTID[dev]);
 }
 
 const QSIZE: u16 = 8;
@@ -1069,6 +1138,8 @@ extern "C" fn hyp_irq_entry() {
         if gicd_irq_enabled(VTIMER_INTID) {
             inject(VTIMER_INTID); // hand the guest its virtual-timer tick
         }
+        // Stage 10: inject any queued virtio used-buffer completion IRQs from this (IRQ) context.
+        drain_virqs();
     }
     if intid != 0x3FF {
         write32(GICC + GICC_EOIR, iar); // spurious (1023) needs no EOI
@@ -1376,7 +1447,11 @@ pub fn run_guest(blob: &[u8]) -> ! {
 
     puts(b"[hyp] stage-2 on: guest RAM IPA=");
     put_hex(GUEST_IPA_BASE);
-    puts(b"..+2MiB -> HPA=");
+    puts(b" + ");
+    put_dec(GUEST_RAM_SIZE >> 20);
+    puts(b" MiB (");
+    put_dec(GUEST_RAM_BLOCKS as u64);
+    puts(b" x 2MiB blocks) -> HPA=");
     put_hex(guest_ram_hpa());
     put(b'\n');
     // Stage 3/6: bring up the vGIC, then arm the EL2 physical timer. Its interrupt fires to EL2 on

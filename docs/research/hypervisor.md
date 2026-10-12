@@ -179,6 +179,30 @@ interrupt injection. Guest EL0<->EL1 syscalls run natively and never trap to EL2
   and the first initramfs byte), then sets up its GICV CPU interface + `VBAR_EL1` and takes three
   hardware-timer ticks **gated by the GICD enable it set**, before PSCI `SYSTEM_OFF`. QEMU-verified.
 
+- **S10 — larger guest RAM + IRQ-driven virtio completions (DONE).** Two scale-hardening items:
+  (1) **Guest RAM grown 2 MiB → 64 MiB**, mapped as 32 contiguous 2 MiB stage-2 blocks
+  (`GUEST_RAM_BLOCKS`), so there is room for a real kernel + initrd; `gpa_to_hpa`/`in_guest` and the
+  DTB `/memory` size scale with it, and a guest access past the 64 MiB still stage-2-faults.
+  (2) **Used-buffer completion interrupts** — each emulated virtio-mmio device now has an
+  `InterruptStatus` register (bit0 = used-buffer) and a distinct GIC SPI (`DEV_INTID` = INTID
+  32/33/34, advertised in each `/virtio_mmio` node's `interrupts` prop). When a queue is serviced
+  the backend sets `InterruptStatus` and **queues the device's vINTID** (`raise_virq`); the EL2
+  timer-IRQ handler **drains and injects** it (`drain_virqs`) — injection is done from the EL2 IRQ
+  context, the only context from which a list-register injection reaches the guest's GICV reliably
+  on this minimal vGIC (a synchronous-context LR write is not presented — see the note below), so a
+  virtio completion is delivered within at most one timer period. `inject` now scans the four GICv2
+  list registers so the timer and a virtio completion can be pending at once. *Proof:* the
+  `hv_kernel` stand-in writes a magic to high guest RAM (IPA `0x4380_0000`, 56 MiB in) and reads it
+  back, then builds a virtio-blk request queue, enables the blk IRQ in the GICD, kicks the queue,
+  `WFI`s, and is **woken by the completion interrupt** — in the handler it detects the completion via
+  the device's `InterruptStatus` (standard virtio-driver practice) and prints the sector-0 data the
+  hypervisor read in, rather than polling the used ring. QEMU-verified.
+  - *vGIC note (honest limitation):* QEMU's minimal GICv2 virtual CPU interface returns **0** from
+    `GICV_(A)IAR` for our list-register-injected vINTIDs, so the guest cannot discriminate a virtual
+    interrupt by its GIC INTID — it uses the device `InterruptStatus` instead (which is how real
+    virtio drivers dispatch anyway). Delivery/EOI (the guest being woken and the handler running)
+    works; precise virtual-INTID read-back from the vGIC is a follow-up (a fuller vGIC or GICv3).
+
 ## What the hypervisor can do today
 
 A `--features hypervisor` Bismuth boot (QEMU `-M virt,virtualization=on`) is a working minimal
@@ -239,15 +263,20 @@ host), a real guest boots through the same path the `hv_kernel` stand-in exercis
 - **virtio-blk / virtio-net backends:** ✅ DONE (S7) — the virtio-mmio emulator now presents a
   block device (host RAM disk) and a net device (loopback) alongside the console, driven by the
   standard guest handshake + virtqueues. For a real guest: back blk with a Bismuth VFS file / larger
-  disk as the rootfs, bridge net to the in-tree NIC, and add used-buffer vIRQ injection (poll → IRQ).
+  disk as the rootfs, bridge net to the in-tree NIC.
+- **used-buffer completion IRQs:** ✅ DONE (S10) — each virtio device raises its `InterruptStatus`
+  and a GIC SPI on queue completion (`raise_virq` → `drain_virqs` from the EL2 timer IRQ), so a guest
+  driver waits on an interrupt rather than polling the used ring.
+- **larger guest RAM:** ✅ DONE (S10) — `GUEST_RAM` is 64 MiB (32 stage-2 blocks), enough for a real
+  kernel + initrd.
 - **Console:** the S4 virtio-console already serves guest output; add RX for input.
 
-The hypervisor *mechanism* is now complete end-to-end (S1–S9): EL2 boot, stage-2 isolation,
-PSCI/SMC, a hardware-timer-driven vGIC with a trap-emulated **distributor** that gates delivery,
-virtio **console/blk/net** backends, the arm64 `Image`-header + **DTB** (with **initrd** hand-off)
-boot protocol. The remaining items are **scale hardening** (used-buffer vIRQ injection instead of
-polling, a VFS-file rootfs, a bridged NIC, a larger `GUEST_RAM`, multi-vCPU `CPU_ON`, GICv3 `GICR`)
-— none blocked *in principle*, all more of the same trap-and-emulate — and then the one hard
+The hypervisor *mechanism* is now complete end-to-end (S1–S10): EL2 boot, stage-2 isolation (64 MiB
+guest RAM), PSCI/SMC, a hardware-timer-driven vGIC with a trap-emulated **distributor** that gates
+delivery, virtio **console/blk/net** backends with **used-buffer completion IRQs**, the arm64
+`Image`-header + **DTB** (with **initrd** hand-off) boot protocol. The remaining items are **scale
+hardening** (a VFS-file rootfs, a bridged NIC, multi-vCPU `CPU_ON`, a GICv3 `GICR` + full virtual
+INTID read-back) — none blocked *in principle*, all more of the same trap-and-emulate — and then the one hard
 **external** dependency: a real aarch64 Linux kernel `Image` + rootfs, which this sandbox cannot
 build or fetch (no cross-toolchain, no network, no hardware). On real hardware, or on QEMU with
 `-kernel <Image> -initrd <rootfs>`, a real Linux guest boots through the very path the `hv_kernel`
@@ -267,8 +296,11 @@ stand-in exercises; once it boots, `docker`/`k8s` inside it is ordinary, unmodif
   blob with a **real arm64 Image header**, loaded through the boot-protocol path. At S9 it validates
   the DTB, programs the emulated GICD (enables INTID 27, reads back `ISENABLER0`/`TYPER`), reads
   `/chosen linux,initrd-start` + the handed-off initramfs, sets `VBAR_EL1` + its GICV CPU interface,
-  takes GICD-gated hardware-timer ticks, then PSCI `SYSTEM_OFF`. (The earlier `hv_guest.rs` — the
+  takes GICD-gated hardware-timer ticks, then PSCI `SYSTEM_OFF`. At **S10** it additionally touches
+  high guest RAM (IPA `0x4380_0000`, 56 MiB in) and does an **interrupt-driven virtio-blk read** —
+  enabling the blk IRQ in the GICD, kicking the queue, `WFI`ing, and servicing the completion from
+  the device `InterruptStatus` in its handler (printing sector 0). (The earlier `hv_guest.rs` — the
   S5–S7 virtio/timer "guest OS" — remains on disk as a historical artifact, no longer compiled.)
   Hypercall ABI: `x0` = command (1 = print `[x1..x1+x2)`, 2 = exit `x1`, 4 = hex-print `x1`).
-  Assemblers: `scratchpad/mkhvkernel2.py` (S9 kernel), `mkhvos.py` (S5–S7 guest).
+  Assemblers: `scratchpad/mkhvkernel3.py` (S10 kernel), `mkhvkernel2.py` (S9), `mkhvos.py` (S5–S7 guest).
 - Run: `bash boards/qemu-virt-aarch64/run-hv.sh` (QEMU `-M virt,virtualization=on`).
