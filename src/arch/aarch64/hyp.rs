@@ -170,6 +170,152 @@ fn inject(vintid: u64) {
     write32(GICH + GICH_LR0, (1 << 30) | (1 << 28) | (vintid as u32 & 0x3FF));
 }
 
+// ---- Stage 4: an emulated virtio-mmio console (MMIO trap-and-emulate) ----
+//
+// The guest sees a standard virtio-mmio device at IPA `VIRTIO_MMIO_BASE` (the QEMU `virt` virtio
+// slot). That window is deliberately left UNMAPPED in stage-2, so every guest load/store there
+// faults to EL2; the abort handler decodes the access from `ESR_EL2` (ISV/SAS/SRT/WnR) and routes
+// it to this register-file emulator, then advances the guest past the instruction. When the guest
+// kicks the queue (`QueueNotify`), the backend walks the split virtqueue *in guest RAM* (via
+// [`gpa_to_hpa`]) and drains the buffers to the real UART — paravirtual console output the way a
+// real guest driver does it, with no Bismuth-specific hypercall.
+//
+// Scope note (see docs/research/hypervisor.md): one queue, modern-mmio register layout but a
+// legacy-style zero-feature handshake, polled (no used-buffer IRQ injected), single-shot drain.
+const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
+const VIRTIO_MMIO_SIZE: u64 = 0x200;
+const VIRTIO_MAGIC: u32 = 0x7472_6976; // "virt"
+const VIRTIO_CONSOLE_ID: u32 = 3;
+
+/// The emulated device's register state (single queue). EL2 runs MMU-off and single-threaded, so a
+/// plain `static mut` is sound here (no atomics).
+struct VirtioConsole {
+    status: u32,
+    queue_sel: u32,
+    queue_num: u32,
+    queue_ready: u32,
+    desc: u64,
+    avail: u64,
+    used: u64,
+    used_idx: u16,
+}
+static mut VIRTIO: VirtioConsole =
+    VirtioConsole { status: 0, queue_sel: 0, queue_num: 0, queue_ready: 0, desc: 0, avail: 0, used: 0, used_idx: 0 };
+
+// Small physical-memory accessors (EL2 MMU-off ⇒ host-physical == VA). Used to walk guest RAM.
+fn rd_u8(a: u64) -> u8 {
+    // SAFETY: `a` is a host-physical address inside the guest RAM arena (bounds-checked by caller).
+    unsafe { core::ptr::read_volatile(a as *const u8) }
+}
+fn rd_u16(a: u64) -> u16 {
+    (rd_u8(a) as u16) | ((rd_u8(a + 1) as u16) << 8)
+}
+fn rd_u32(a: u64) -> u32 {
+    (rd_u16(a) as u32) | ((rd_u16(a + 2) as u32) << 16)
+}
+fn rd_u64(a: u64) -> u64 {
+    (rd_u32(a) as u64) | ((rd_u32(a + 4) as u64) << 32)
+}
+fn wr_u16(a: u64, v: u16) {
+    // SAFETY: `a` is inside the guest RAM arena (bounds-checked by caller).
+    unsafe {
+        core::ptr::write_volatile(a as *mut u8, v as u8);
+        core::ptr::write_volatile((a + 1) as *mut u8, (v >> 8) as u8);
+    }
+}
+fn wr_u32(a: u64, v: u32) {
+    wr_u16(a, v as u16);
+    wr_u16(a + 2, (v >> 16) as u16);
+}
+
+/// Emulate a guest read of the virtio-mmio register at `off`.
+fn virtio_read(off: usize) -> u32 {
+    // SAFETY: single-threaded EL2 access to our own device state.
+    let v = unsafe { &*addr_of_mut!(VIRTIO) };
+    match off {
+        0x000 => VIRTIO_MAGIC,
+        0x004 => 2,                 // Version (modern mmio)
+        0x008 => VIRTIO_CONSOLE_ID, // DeviceID = console
+        0x00c => 0x554d_4551,       // VendorID "QEMU"
+        0x010 => 0,                 // DeviceFeatures (expose none — legacy-style handshake)
+        0x034 => 8,                 // QueueNumMax
+        0x044 => v.queue_ready,
+        0x060 => 0,                 // InterruptStatus
+        0x070 => v.status,
+        0x0fc => 0,                 // ConfigGeneration
+        _ => 0,
+    }
+}
+
+/// Emulate a guest write of `val` to the virtio-mmio register at `off`; on `QueueNotify`, drain.
+fn virtio_write(off: usize, val: u32) {
+    // SAFETY: single-threaded EL2 access to our own device state.
+    let v = unsafe { &mut *addr_of_mut!(VIRTIO) };
+    match off {
+        0x030 => v.queue_sel = val,
+        0x038 => v.queue_num = val,
+        0x044 => v.queue_ready = val,
+        0x050 => virtio_notify(), // QueueNotify: the guest kicked the queue
+        0x070 => v.status = val,  // 0 = device reset
+        0x080 => v.desc = (v.desc & 0xffff_ffff_0000_0000) | val as u64,
+        0x084 => v.desc = (v.desc & 0xffff_ffff) | ((val as u64) << 32),
+        0x090 => v.avail = (v.avail & 0xffff_ffff_0000_0000) | val as u64,
+        0x094 => v.avail = (v.avail & 0xffff_ffff) | ((val as u64) << 32),
+        0x0a0 => v.used = (v.used & 0xffff_ffff_0000_0000) | val as u64,
+        0x0a4 => v.used = (v.used & 0xffff_ffff) | ((val as u64) << 32),
+        _ => {} // DeviceFeaturesSel/DriverFeatures(Sel)/InterruptACK: accepted, no state needed
+    }
+}
+
+/// Walk the split virtqueue in guest RAM and drain each newly-available buffer to the UART,
+/// marking it used. Descriptor/ring addresses are guest IPAs translated through stage-2.
+fn virtio_notify() {
+    // SAFETY: single-threaded EL2 access to our own device state.
+    let v = unsafe { &mut *addr_of_mut!(VIRTIO) };
+    let qsize = if v.queue_num == 0 { 8 } else { v.queue_num as u16 };
+    let (Some(desc), Some(avail), Some(used)) =
+        (gpa_to_hpa(v.desc), gpa_to_hpa(v.avail), gpa_to_hpa(v.used))
+    else {
+        puts(b"[hyp] virtio: queue addresses outside guest RAM\n");
+        return;
+    };
+    let avail_idx = rd_u16(avail + 2); // avail.idx
+    while v.used_idx != avail_idx {
+        let slot = (v.used_idx % qsize) as u64;
+        let head = rd_u16(avail + 4 + slot * 2); // desc index for this request
+        // Follow the descriptor chain, draining each buffer to the UART.
+        let mut di = head;
+        let mut total = 0u32;
+        loop {
+            let Some(d) = gpa_to_hpa(v.desc.wrapping_add(di as u64 * 16)) else { break };
+            let _ = desc;
+            let buf_ipa = rd_u64(d);
+            let len = rd_u32(d + 8);
+            let flags = rd_u16(d + 12);
+            let next = rd_u16(d + 14);
+            if let Some(buf) = gpa_to_hpa(buf_ipa) {
+                if buf_ipa + len as u64 <= GUEST_IPA_BASE + GUEST_RAM_SIZE {
+                    for i in 0..len as u64 {
+                        put(rd_u8(buf + i));
+                    }
+                    total += len;
+                }
+            }
+            if flags & 0x1 != 0 {
+                di = next; // VIRTQ_DESC_F_NEXT
+            } else {
+                break;
+            }
+        }
+        // Publish the completion in the used ring.
+        let uslot = (v.used_idx % qsize) as u64;
+        wr_u32(used + 4 + uslot * 8, head as u32); // used.ring[].id
+        wr_u32(used + 8 + uslot * 8, total); // used.ring[].len
+        v.used_idx = v.used_idx.wrapping_add(1);
+        wr_u16(used + 2, v.used_idx); // used.idx
+    }
+}
+
 /// Write one byte to the PL011, spinning while the TX FIFO is full.
 fn put(b: u8) {
     // SAFETY: MMIO on the QEMU `virt` PL011; the hypervisor owns the UART.
@@ -300,8 +446,9 @@ extern "C" fn hvc_vector() {
     )
 }
 
-/// Service one guest synchronous trap. `frame` points at the saved GPR image (`x0..x30`).
-extern "C" fn hvc_entry(frame: *const u64) {
+/// Service one guest synchronous trap. `frame` points at the saved GPR image (`x0..x30`); it is
+/// mutable so an emulated MMIO read can deliver its result into the guest's destination register.
+extern "C" fn hvc_entry(frame: *mut u64) {
     let esr: u64;
     // SAFETY: reading the EL2 syndrome register is side-effect free.
     unsafe { asm!("mrs {}, esr_el2", out(reg) esr, options(nomem, nostack, preserves_flags)) };
@@ -320,6 +467,36 @@ extern "C" fn hvc_entry(frame: *const u64) {
         if ec == 0x24 || ec == 0x20 {
             // Faulting IPA: HPFAR_EL2[43:4] = IPA[51:12]; combine with FAR_EL2's page offset.
             let ipa = ((hpfar & 0xF_FFFF_FFF0) << 8) | (far & 0xFFF);
+            // Stage 4: a data abort inside the emulated virtio-mmio window is not a violation —
+            // trap-and-emulate the register access and resume the guest past the instruction.
+            if ec == 0x24 && (VIRTIO_MMIO_BASE..VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE).contains(&ipa) {
+                let iss = esr & 0x1FF_FFFF;
+                if (iss >> 24) & 1 == 1 {
+                    // ISV=1: the syndrome describes the access. SRT=reg, WnR=direction.
+                    let srt = ((iss >> 16) & 0x1f) as usize;
+                    let wnr = (iss >> 6) & 1;
+                    let off = (ipa - VIRTIO_MMIO_BASE) as usize;
+                    if wnr == 1 {
+                        // Store: the value is in the source register (x31 = XZR = 0).
+                        let val = if srt == 31 { 0 } else { unsafe { *frame.add(srt) } } as u32;
+                        virtio_write(off, val);
+                    } else {
+                        // Load: deliver the emulated register value into the destination register.
+                        let val = virtio_read(off);
+                        if srt != 31 {
+                            unsafe { *frame.add(srt) = val as u64 };
+                        }
+                    }
+                    // Resume the guest at the next instruction (all loads/stores here are 4 bytes).
+                    // SAFETY: advancing the guest's return address past the emulated access.
+                    unsafe { asm!("msr elr_el2, {}", in(reg) elr + 4, options(nomem, nostack, preserves_flags)) };
+                    return;
+                }
+                puts(b"[hyp] virtio: un-decodable access (ISV=0) at IPA=");
+                put_hex(ipa);
+                put(b'\n');
+                hyp_exit(1);
+            }
             puts(b"[hyp] stage-2 fault: guest ");
             puts(if ec == 0x24 { b"read/write" } else { b"exec" });
             puts(b" of unmapped IPA=");

@@ -93,10 +93,22 @@ interrupt injection. Guest EL0<->EL1 syscalls run natively and never trap to EL2
   request) rather than a hardware `CNTV`/maintenance-interrupt loop at EL2 — that HW-timer-linked
   path (trap/offset `CNTVOFF_EL2`, refill LRs on the maintenance IRQ) is the S3b/S4 refinement.
   What is proven is the core vGIC mechanism: LR injection → GICV → guest IRQ handler → EOI.
-- **S4 — virtio-mmio backends.** Bismuth presents the guest virtio-mmio devices (console, block,
-  net) whose rings live in guest-physical RAM; trap the guest's doorbell writes (stage-2 MMIO
-  faults) and service the queues against Bismuth's real drivers/VFS/NIC. This is how the guest
-  does I/O without real device passthrough.
+- **S4 — virtio-mmio console backend (DONE).** Bismuth presents the guest a virtio-mmio device at
+  guest IPA `0x0a00_0000` (the QEMU `virt` virtio slot), left *unmapped* in stage-2 so every guest
+  access there faults to EL2. The abort handler decodes the trapped load/store from `ESR_EL2`
+  (ISV/SAS/SRT/WnR), services it against a register-file emulator (`virtio_read`/`virtio_write` in
+  `hyp.rs`), and advances the guest past the instruction (ELR_EL2 += 4) — a classic MMIO
+  trap-and-emulate. On `QueueNotify` the backend walks the split virtqueue **in guest RAM**
+  (descriptor table / avail ring / used ring, all guest IPAs translated via `gpa_to_hpa`) and
+  drains each available buffer to the real PL011, then publishes the used ring. QEMU-verified: the
+  S4 guest reads `DeviceID=3` back through the emulator, runs the ACKNOWLEDGE→DRIVER→FEATURES_OK→
+  DRIVER_OK status handshake, programs queue 0's addresses + `QueueReady`, kicks `QueueNotify`, and
+  its string emerges on the UART via the hypervisor's queue walk — paravirtual console output with
+  no Bismuth-specific hypercall. Simplifications (deliberate, documented): one queue; modern-mmio
+  register layout but a legacy-style zero-feature handshake; the descriptor + avail ring are static
+  guest data (the guest drives the MMIO protocol + doorbell); polled single-shot drain with no
+  used-buffer vIRQ injected back (the S3 vGIC path would carry that); block/net virtio backends
+  (serving Bismuth's VFS/NIC to the guest) are the S4b extension.
 - **S5 — boot a minimal guest OS.** With S2–S4, load a guest `Image`+DTB at the guest-physical
   kernel address and boot it. Demonstrable here with a *hand-assembled* mini-guest that uses the
   vGIC/timer/virtio (same no-toolchain tactic as the Linux-ABI ELFs).
