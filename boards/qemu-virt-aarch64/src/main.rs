@@ -31,6 +31,8 @@ mod linux_elf;
 #[cfg(feature = "linux-demo")]
 mod linux_mmap;
 #[cfg(feature = "linux-demo")]
+mod linux_spin;
+#[cfg(feature = "linux-demo")]
 mod linux_write;
 
 #[cfg(feature = "linux-demo")]
@@ -424,6 +426,10 @@ fn lx_hello(_: usize) {
     lx_launch(&linux_elf::HELLO_ELF, "hello");
 }
 #[cfg(feature = "linux-demo")]
+fn lx_spin(_: usize) {
+    lx_launch(&linux_spin::SPIN_ELF, "spin");
+}
+#[cfg(feature = "linux-demo")]
 fn lx_cat(_: usize) {
     lx_launch(&linux_cat::CAT_ELF, "cat");
 }
@@ -441,15 +447,16 @@ fn lx_write(_: usize) {
 /// declarative directory grant confining it to the mounted root.
 #[cfg(feature = "linux-demo")]
 static LINUX_MANIFEST: bismuth::security::container::ContainerManifest = {
-    use bismuth::security::container::{ContainerDecl, ContainerEntry, ContainerManifest, OnFault};
+    use bismuth::security::container::{ContainerDecl, ContainerEntry, ContainerManifest, CpuBudget, OnFault};
     use bismuth::security::manifest::{DirGrantDecl, DomainDecl};
     ContainerManifest {
         containers: &[
+            // A CPU-bound container with a CPU budget (cgroup cpu.max analog).
             ContainerDecl {
-                domain: DomainDecl { spec: DomainSpec::isolated("lxhello", 4, 2), grants: &[], dirs: &[] },
-                entry: ContainerEntry::privileged(lx_hello, 3, &LXS1),
+                domain: DomainDecl { spec: DomainSpec::isolated("lxspin", 4, 2), grants: &[], dirs: &[] },
+                entry: ContainerEntry::privileged(lx_spin, 3, &LXS1),
                 version: 1,
-                cpu: None,
+                cpu: Some(CpuBudget { period_ms: 100, micros: 90_000, partitioned: false }),
                 ram_bytes: 131072,
                 on_fault: OnFault::Stop,
                 image_hash: [0; 32],
@@ -514,7 +521,7 @@ fn linux_demo() {
     fs::close(f);
 
     container::install(&LINUX_MANIFEST).unwrap(); // creates domains, applies dir grants, seals
-    for name in ["lxhello", "lxcat", "lxmmap", "lxwrite"] {
+    for name in ["lxspin", "lxcat", "lxmmap", "lxwrite"] {
         let c = container::find(name).unwrap();
         kprintln!("[linux] starting container '{name}'");
         container::start(c).unwrap();
@@ -542,9 +549,16 @@ fn linux_monitor(_: usize) {
             break;
         }
     }
-    // Memory cgroup: each Linux container was charged for its resident process footprint.
+    // cgroups: each Linux container was charged for its resident footprint, and the scheduler
+    // accrued CPU ticks to its domain (the CPU-bound 'lxspin' shows a nonzero cpu.stat).
     container::for_each(|c, decl| {
-        kprintln!("[cgroup] {}: memory.current={} / memory.max={}", decl.name(), container::mem_used(c), decl.ram_bytes);
+        kprintln!(
+            "[cgroup] {}: memory.current={} / memory.max={}, cpu.used_ticks={}",
+            decl.name(),
+            container::mem_used(c),
+            decl.ram_bytes,
+            container::cpu_used(c)
+        );
     });
 
     // The 'lxwrite' container created a file in the shared VFS; read it back to prove its write
@@ -556,7 +570,7 @@ fn linux_monitor(_: usize) {
         }
         fs::close(f);
     }
-    kprintln!("aarch64 Linux-container demo complete: four Linux binaries ran as containers — write loop, VFS reader (lseek), heap allocator (mmap), and a file writer. PASS");
+    kprintln!("aarch64 Linux-container demo complete: four Linux binaries ran as containers — a CPU-bound spinner (cpu cgroup), a VFS reader (lseek), a heap allocator (mmap), and a file writer — with per-container cpu/memory cgroups. PASS");
     bismuth::arch::aarch64::qemu_exit(0);
 }
 
