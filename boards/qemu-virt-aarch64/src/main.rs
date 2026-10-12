@@ -245,6 +245,32 @@ fn net_demo() {
 // workload on QEMU through the full path — domain + capability grant + cgroups + namespaces.
 #[cfg(feature = "interactive")]
 static WEBAPP_STACK: UserStack2K = UserStack2K::new();
+#[cfg(feature = "interactive")]
+static WASM_STACK: bismuth::Stack<8192> = bismuth::Stack::new();
+
+// A validated WASM module (hand-assembled): writes "hi" to stdout via WASI `fd_write` and
+// reports the byte count. This is the workload of the `wasmapp` container.
+#[cfg(feature = "interactive")]
+static WASM_MOD: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0d, 0x02, 0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
+    0x60, 0x00, 0x01, 0x7f, 0x02, 0x23, 0x01, 0x16, b'w', b'a', b's', b'i', b'_', b's', b'n', b'a', b'p', b's', b'h',
+    b'o', b't', b'_', b'p', b'r', b'e', b'v', b'i', b'e', b'w', b'1', 0x08, b'f', b'd', b'_', b'w', b'r', b'i', b't',
+    b'e', 0x00, 0x00, 0x03, 0x02, 0x01, 0x01, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x09, 0x01, 0x05, b'w', b't', b'e',
+    b's', b't', 0x00, 0x01, 0x0a, 0x32, 0x01, 0x30, 0x00, 0x41, 0x08, 0x41, 0xe8, 0x00, 0x3a, 0x00, 0x00, 0x41, 0x09,
+    0x41, 0xe9, 0x00, 0x3a, 0x00, 0x00, 0x41, 0x00, 0x41, 0x08, 0x36, 0x02, 0x00, 0x41, 0x04, 0x41, 0x02, 0x36, 0x02,
+    0x00, 0x41, 0x01, 0x41, 0x00, 0x41, 0x01, 0x41, 0x14, 0x10, 0x00, 0x1a, 0x41, 0x14, 0x28, 0x02, 0x00, 0x0b,
+];
+
+/// A WASM container workload: the runtime (this EL1 task) interprets the module, which is
+/// sandboxed by the interpreter — the OCI-WASM container model. It prints via WASI and exits.
+#[cfg(feature = "interactive")]
+fn wasm_entry(_: usize) {
+    kprintln!("[wasmapp] interpreting embedded wasm (WASI)...");
+    match bismuth::wasm::Module::parse(WASM_MOD) {
+        Ok(m) => kprintln!("\n[wasmapp] wasm exited, fd_write reported {:?} bytes", m.invoke("wtest", &[])),
+        Err(e) => kprintln!("[wasmapp] parse failed: {e:?}"),
+    }
+}
 
 /// A sandboxed (EL0) container workload: read its granted sensor, then serve indefinitely.
 #[cfg(feature = "interactive")]
@@ -265,19 +291,31 @@ static WEBAPP_MANIFEST: bismuth::security::container::ContainerManifest = {
     use bismuth::security::container::{ContainerDecl, ContainerEntry, ContainerManifest, CpuBudget, OnFault};
     use bismuth::security::manifest::{DomainDecl, GrantDecl};
     ContainerManifest {
-        containers: &[ContainerDecl {
-            domain: DomainDecl {
-                spec: DomainSpec::sandboxed("webapp", 4, 1),
-                grants: &[GrantDecl { device: "sensor0", name: "env", rights: Rights::READ }],
-                dirs: &[],
+        containers: &[
+            ContainerDecl {
+                domain: DomainDecl {
+                    spec: DomainSpec::sandboxed("webapp", 4, 1),
+                    grants: &[GrantDecl { device: "sensor0", name: "env", rights: Rights::READ }],
+                    dirs: &[],
+                },
+                entry: ContainerEntry::user(webapp, 3, &WEBAPP_STACK),
+                version: 1,
+                cpu: Some(CpuBudget { period_ms: 100, micros: 50_000, partitioned: false }),
+                ram_bytes: 4096,
+                on_fault: OnFault::Restart { max: 3, window_ms: 1000 },
+                image_hash: [0; 32],
             },
-            entry: ContainerEntry::user(webapp, 3, &WEBAPP_STACK),
-            version: 1,
-            cpu: Some(CpuBudget { period_ms: 100, micros: 50_000, partitioned: false }),
-            ram_bytes: 4096,
-            on_fault: OnFault::Restart { max: 3, window_ms: 1000 },
-            image_hash: [0; 32],
-        }],
+            // A WASM-backed container: its workload is a wasm module run by the interpreter.
+            ContainerDecl {
+                domain: DomainDecl { spec: DomainSpec::isolated("wasmapp", 4, 1), grants: &[], dirs: &[] },
+                entry: ContainerEntry::privileged(wasm_entry, 3, &WASM_STACK),
+                version: 1,
+                cpu: None,
+                ram_bytes: 65536,
+                on_fault: OnFault::Stop,
+                image_hash: [0; 32],
+            },
+        ],
         supervisor: None,
     }
 };
@@ -291,6 +329,7 @@ fn shell_task(_: usize) {
 #[cfg(feature = "interactive")]
 fn container_host() {
     use bismuth::security::container;
+    bismuth::kernel::heap::init(); // the WASM container's interpreter uses the bounded heap
     driver::register("sensor0", &SENSOR).expect("register sensor");
     container::install(&WEBAPP_MANIFEST).expect("install container");
     if let Some(c) = container::find("webapp") {
