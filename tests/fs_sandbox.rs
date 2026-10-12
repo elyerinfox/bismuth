@@ -27,6 +27,51 @@ fn take() -> Vec<String> {
 static FS: RamFs<32, 64, 64> = RamFs::new();
 static US: UserStack2K = UserStack2K::new();
 
+static FS3: RamFs<32, 64, 64> = RamFs::new();
+
+#[test]
+fn cap_opendir_lists_only_within_the_granted_subtree() {
+    let _s = serial();
+    FS3.format();
+    sim::run_to_completion(|| {
+        fs::mount("/ls", &FS3).unwrap();
+        fs::mkdir("/ls/jail").unwrap();
+        for name in ["a.txt", "b.txt"] {
+            let mut p = String::from("/ls/jail/");
+            p.push_str(name);
+            fs::close(fs::open(&p, OpenMode::RDWR.with(OpenMode::CREATE)).unwrap());
+        }
+        fs::mkdir("/ls/jail/sub").unwrap();
+
+        // Grant the current (trusted) domain a read capability over the jail, then list it
+        // through that capability — the confined analogue of opendir.
+        let h = fs::grant_dir(security::current(), "/ls/jail", Rights::READ, "lsjail").unwrap();
+        let cap = fs::DirCap::from_handle(h);
+
+        let d = fs::cap_opendir(&cap, ".").unwrap();
+        let mut names: Vec<String> = Vec::new();
+        let mut saw_subdir = false;
+        let mut e = bismuth::fs::DirEntry::default();
+        while fs::readdir(d, &mut e).unwrap() {
+            if e.name() == "sub" {
+                saw_subdir = e.kind == NodeKind::Dir;
+            }
+            names.push(e.name().to_string());
+        }
+        fs::closedir(d);
+        names.sort();
+        assert_eq!(names, vec!["a.txt".to_string(), "b.txt".into(), "sub".into()]);
+        assert!(saw_subdir, "'sub' reported as a directory");
+
+        // A file path is not a directory.
+        assert_eq!(fs::cap_opendir(&cap, "a.txt").err(), Some(bismuth::Error::NotADirectory));
+        // A subdirectory within the jail opens fine; `..` is clamped at the jail root (no escape),
+        // so it still resolves to a directory inside the subtree rather than the real parent.
+        assert!(fs::cap_opendir(&cap, "sub").is_ok());
+        assert!(fs::cap_opendir(&cap, "../..").is_ok());
+    });
+}
+
 // OpenMode bits as the syscall ABI carries them (see `fs::OpenMode`).
 const READ: u8 = OpenMode::READ.0;
 const RDWR: u8 = OpenMode::RDWR.0;

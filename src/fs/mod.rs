@@ -443,6 +443,17 @@ pub fn readdir(d: Dir, out: &mut DirEntry) -> Result<bool, Error> {
     }
 }
 
+/// The directory's current iteration cursor (an opaque position for [`seekdir`]).
+pub fn telldir(d: Dir) -> Result<u64, Error> {
+    snapshot(d.0).map(|(of, _)| of.pos)
+}
+
+/// Restore a directory's iteration cursor to a value from [`telldir`] (e.g. to re-read an entry
+/// that did not fit a caller's buffer).
+pub fn seekdir(d: Dir, pos: u64) {
+    set_pos(d.0, pos);
+}
+
 /// Close a directory handle.
 pub fn closedir(d: Dir) {
     free_slot(d.0);
@@ -544,6 +555,20 @@ pub fn cap_open(cap: &DirCap, rel: &str, mode: OpenMode) -> Result<File, Error> 
         }
         Err(e) => Err(e),
     }
+}
+
+/// Open a directory for iteration by a path relative to `cap`'s subtree (requires `READ`). The
+/// confined analogue of [`opendir`]: a sandboxed/loaded task lists only directories at or below
+/// the subtree the capability names.
+pub fn cap_opendir(cap: &DirCap, rel: &str) -> Result<Dir, Error> {
+    let (mount, base, g, _caller) = cap.resolve(Rights::READ)?;
+    let fs = mount_checked(mount, g)?;
+    let node = resolve_from(fs, FsVnode(base), rel)?;
+    if fs.stat(node)?.kind != NodeKind::Dir {
+        return Err(Error::NotADirectory);
+    }
+    let of = OpenFile { mount: MountId(mount), node, id: OpenId(0), pos: 0, mode: OpenMode::READ, generation: g };
+    alloc_slot(of).map(Dir).ok_or(Error::NoResources)
 }
 
 /// Metadata of a node relative to `cap`'s subtree (requires `READ`).
