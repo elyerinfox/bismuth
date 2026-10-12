@@ -1,0 +1,7 @@
+[build]
+target = "aarch64-unknown-none-softfloat"
+
+# No QEMU machine emulates the Jetson; this board is build-verified and runs on real
+# hardware (loaded via U-Boot/CBoot). No `runner` — use `cargo build`.
+[target.aarch64-unknown-none-softfloat]
+rustflags = ["-C", "link-arg=-Tlink.ld"]

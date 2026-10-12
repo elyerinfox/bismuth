@@ -1,0 +1,6 @@
+[build]
+target = "armv7a-none-eabi"
+
+[target.armv7a-none-eabi]
+runner = "qemu-system-arm -M raspi2b -nographic -semihosting -kernel"
+rustflags = ["-C", "link-arg=-Tlink.ld"]

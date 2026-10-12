@@ -1,0 +1,29 @@
+[package]
+name = "bismuth-board-qemu-x86_64"
+version = "0.1.0"
+edition = "2024"
+description = "Bismuth boot board for QEMU x86-64 (via the rust-osdev bootloader crate)"
+publish = false
+
+# Standalone: built for x86_64-unknown-none, independent of the kernel's host workspace.
+[workspace]
+
+[[bin]]
+name = "bismuth-x86"
+path = "src/main.rs"
+
+[dependencies]
+# No `crypto`/`tpm` here: those RustCrypto crates need SSE, which the soft-float
+# x86_64-unknown-none target disables. Enabling SSE + saving FP state on context switch is
+# the documented follow-up for crypto on x86.
+bismuth-kernel = { path = "../..", default-features = false, features = ["edge", "fs", "power", "extensions", "posix"] }
+bootloader_api = "0.11.17"
+
+[profile.dev]
+panic = "abort"
+opt-level = "s"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

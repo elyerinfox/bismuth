@@ -1,0 +1,39 @@
+[package]
+name = "bismuth-board-qemu-virt-aarch64"
+version = "0.1.0"
+edition = "2024"
+description = "Bismuth boot board for QEMU aarch64 'virt' (Cortex-A, the first application-class ARM port)"
+publish = false
+
+# Standalone: built for aarch64-unknown-none-softfloat, independent of the kernel's host workspace.
+[workspace]
+
+[[bin]]
+name = "bismuth-aarch64"
+path = "src/main.rs"
+
+[dependencies]
+# Soft-float kernel (matches the x86 decision): the context switch saves only GPRs, no NEON.
+# No crypto/tpm (RustCrypto needs SIMD); EL0 NEON is a later, lazy-save addition.
+bismuth-kernel = { path = "../..", default-features = false, features = ["edge", "fs", "power", "extensions", "posix", "net", "net-ip", "containers", "shell", "wasm"] }
+
+[features]
+# When set, the board drops into the interactive serial shell after the demo instead of
+# exiting QEMU. Build/run with `cargo run --features interactive`.
+interactive = []
+# When set, the board runs the networking demo (virtio-net + IPv4/UDP over SLIRP) instead of
+# the EL0 isolation demo. Build/run with `cargo run --features net-demo` plus a `-netdev`.
+net-demo = []
+# When set, the board loads and runs a (hand-assembled) Linux aarch64 ELF at EL0 through the
+# `linux-abi` personality — it prints via the Linux `write` syscall and exits via `exit`.
+# Build/run with `cargo run --features linux-demo`.
+linux-demo = ["bismuth-kernel/linux-abi"]
+
+[profile.dev]
+panic = "abort"
+opt-level = "s"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

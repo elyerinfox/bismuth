@@ -1,0 +1,24 @@
+[package]
+name = "bismuth-board-rpi5"
+version = "0.1.0"
+edition = "2024"
+description = "Bismuth boot board for the Raspberry Pi 5 (BCM2712, Cortex-A76); build-verified, runtime on real hardware (no QEMU machine)"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bismuth-rpi5"
+path = "src/main.rs"
+
+[dependencies]
+bismuth-kernel = { path = "../..", default-features = false, features = ["edge", "fs", "power", "extensions", "posix"] }
+
+[profile.dev]
+panic = "abort"
+opt-level = "s"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

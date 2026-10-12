@@ -1,0 +1,24 @@
+[package]
+name = "bismuth-board-qemu-raspi2b"
+version = "0.1.0"
+edition = "2024"
+description = "Bismuth boot board for the Raspberry Pi 2 (BCM2836, Cortex-A7, ARMv7-A 32-bit), QEMU raspi2b"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bismuth-raspi2b"
+path = "src/main.rs"
+
+[dependencies]
+bismuth-kernel = { path = "../..", default-features = false, features = ["cortex-a", "edge", "fs", "power", "extensions", "posix"] }
+
+[profile.dev]
+panic = "abort"
+opt-level = "s"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

@@ -1,0 +1,24 @@
+[package]
+name = "bismuth-board-qemu-raspi0"
+version = "0.1.0"
+edition = "2024"
+description = "Bismuth boot board for the Raspberry Pi 1 / Zero / Zero W (BCM2835, ARM1176, ARMv6), QEMU raspi0. Built with nightly -Zbuild-std (no stable bare ARMv6 target)."
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "bismuth-raspi0"
+path = "src/main.rs"
+
+[dependencies]
+bismuth-kernel = { path = "../..", default-features = false, features = ["armv6", "edge", "fs", "power", "extensions", "posix"] }
+
+[profile.dev]
+panic = "abort"
+opt-level = "s"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
