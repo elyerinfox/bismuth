@@ -25,9 +25,30 @@ const UART: usize = 0x0900_0000;
 const UART_DR: usize = 0x00; // data register
 const UART_FR: usize = 0x18; // flag register; TXFF = bit 5
 
-/// Hypercall numbers (the stage-1 ABI).
+/// Hypercall numbers (the stage-1 ABI; stage 3 adds `HVC_TICK`).
 const HVC_PRINT: u64 = 1;
 const HVC_EXIT: u64 = 2;
+/// Stage 3: the guest asks the hypervisor to inject its next virtual-timer interrupt.
+const HVC_TICK: u64 = 3;
+
+// ---- Stage 3: vGIC (GICv2 virtualization) ----
+//
+// QEMU `virt` GICv2 has, besides GICD (0x0800_0000) / GICC (0x0801_0000), a hypervisor control
+// interface GICH (0x0803_0000) and a virtual CPU interface GICV (0x0804_0000). The hypervisor
+// enables GICH and injects a virtual interrupt by writing a list register (GICH_LR0); the guest's
+// own "GIC CPU interface" is GICV, which stage-2 maps into the guest at the standard GICC address
+// (0x0801_0000) — so the guest acknowledges (GICV_IAR) and ends (GICV_EOIR) the virtual interrupt
+// exactly as if it were talking to a real GICC, never seeing the host GIC.
+const GICH: usize = 0x0803_0000;
+const GICH_HCR: usize = 0x000; // hypervisor control; bit0 = En
+const GICH_VMCR: usize = 0x008; // virtual machine control (mirrors the guest's GICV_CTLR/PMR)
+const GICH_LR0: usize = 0x100; // list register 0
+const GICD: usize = 0x0800_0000; // physical distributor
+const GICC: usize = 0x0801_0000; // physical CPU interface (host side)
+const GICV_PA: u64 = 0x0804_0000; // host-physical virtual CPU interface
+const GUEST_GICC_IPA: u64 = 0x0801_0000; // where the guest expects its GIC CPU interface
+/// The ARM virtual-timer PPI (`CNTV`), the vINTID we inject as the guest's timer tick.
+const VTIMER_INTID: u64 = 27;
 
 // ---- Stage 2: the guest's own guest-physical (IPA) address space ----
 //
@@ -49,7 +70,9 @@ static mut GUEST_RAM: GuestRam = GuestRam([0; GUEST_RAM_SIZE as usize]);
 #[repr(C, align(4096))]
 struct S2Table([u64; 512]);
 static mut S2_L1: S2Table = S2Table([0; 512]); // level 1 (1 GiB per entry)
-static mut S2_L2: S2Table = S2Table([0; 512]); // level 2 (2 MiB per entry)
+static mut S2_L2: S2Table = S2Table([0; 512]); // level 2 (2 MiB per entry), guest RAM GiB
+static mut S2_L2_LOW: S2Table = S2Table([0; 512]); // level 2 for the low GiB (holds the GIC)
+static mut S2_L3_GIC: S2Table = S2Table([0; 512]); // level 3 (4 KiB) remapping GICC IPA -> GICV
 
 /// Host-physical base of the guest RAM arena (stable: it is a static).
 fn guest_ram_hpa() -> u64 {
@@ -85,6 +108,22 @@ fn setup_stage2() {
         // L1[1] = table descriptor → L2 (IPA 0x4000_0000 has level-1 index 1).
         l1.add(1).write_volatile((l2 as u64) | 0x3);
 
+        // Stage 3: map the guest's GIC CPU interface. IPA GUEST_GICC_IPA (0x0801_0000) lives in the
+        // low GiB (L1 index 0), so refine that GiB down to a 4 KiB page that redirects the guest's
+        // GICC page to the real GICV. L2_LOW[64] covers 0x0800_0000..0x0820_0000 as a table → L3;
+        // L3[16] maps 0x0801_0000 → GICV as Device (nGnRnE, S2AP RW, AF): PA | 0x4C3.
+        let l2lo = addr_of_mut!(S2_L2_LOW) as *mut u64;
+        let l3 = addr_of_mut!(S2_L3_GIC) as *mut u64;
+        for i in 0..512 {
+            l2lo.add(i).write_volatile(0);
+            l3.add(i).write_volatile(0);
+        }
+        let l2lo_idx = (GUEST_GICC_IPA >> 21) as usize & 0x1FF; // 64
+        let l3_idx = (GUEST_GICC_IPA >> 12) as usize & 0x1FF; // 16
+        l3.add(l3_idx).write_volatile(GICV_PA | 0x4C3);
+        l2lo.add(l2lo_idx).write_volatile((l3 as u64) | 0x3);
+        l1.add(0).write_volatile((l2lo as u64) | 0x3);
+
         // VTCR_EL2: T0SZ=24 (40-bit IPA), SL0=1 (start L1), IRGN0/ORGN0=WB, SH0=inner, TG0=4KiB,
         // PS=40-bit, bit31 RES1.
         let vtcr: u64 = 0x8000_0000 | 24 | (1 << 6) | (1 << 8) | (1 << 10) | (3 << 12) | (2 << 16);
@@ -101,6 +140,34 @@ fn setup_stage2() {
             options(nostack, preserves_flags),
         );
     }
+}
+
+/// Write a 32-bit MMIO register.
+fn write32(addr: usize, val: u32) {
+    // SAFETY: MMIO on a GIC register the hypervisor owns.
+    unsafe { core::ptr::write_volatile(addr as *mut u32, val) };
+}
+
+/// Enable the GICv2 hypervisor interface so list-register injections reach the guest's GICV, and
+/// seed the virtual CPU-interface control (GICH_VMCR): VENG0+VENG1 (both groups enabled) and
+/// VPMR = top priority = 0x1F (accept all) — so a pending list register is actually signalled to
+/// the guest even before it touches GICV. (The guest's own GICV_CTLR/PMR writes update VMCR too.)
+fn gich_enable() {
+    // The virtual CPU interface sits behind the physical GIC, so the host must enable the
+    // physical distributor + CPU interface for virtual delivery to work.
+    write32(GICD + 0x0, 1); // GICD_CTLR.Enable
+    write32(GICC + 0x4, 0xFF); // GICC_PMR = accept all
+    write32(GICC + 0x0, 1); // GICC_CTLR.Enable
+    write32(GICH + GICH_HCR, 1); // GICH_HCR.En = 1
+    write32(GICH + GICH_VMCR, 0xF800_0003); // VPMR=0x1F<<27 | VENG1 | VENG0
+}
+
+/// Inject a pending virtual interrupt into list register 0: the guest takes it through its GICV
+/// once it unmasks IRQs and enables its CPU interface. GICv2 LR layout: vINTID[9:0],
+/// priority[27:23]=0 (highest), State[29:28]=0b01 (pending), Grp1 (bit30=1 → delivered as a
+/// non-secure vIRQ, not a Group-0 vFIQ), HW=0 (software). The guest must enable Group 1 on GICV.
+fn inject(vintid: u64) {
+    write32(GICH + GICH_LR0, (1 << 30) | (1 << 28) | (vintid as u32 & 0x3FF));
 }
 
 /// Write one byte to the PL011, spinning while the TX FIFO is full.
@@ -288,6 +355,16 @@ extern "C" fn hvc_entry(frame: *const u64) {
                 _ => puts(b"[hyp] rejected print: pointer outside guest RAM\n"),
             }
         }
+        HVC_TICK => {
+            // The guest asks for its next virtual-timer interrupt: inject it into GICH_LR0. The
+            // guest takes it (through GICV) as soon as this `eret` returns to EL1.
+            inject(VTIMER_INTID);
+        }
+        4 => {
+            // Diagnostic: print `a1` as hex (used by the guest to dump ESR_EL1 etc.).
+            put_hex(a1);
+            put(b'\n');
+        }
         HVC_EXIT => {
             puts(b"[hyp] guest requested exit, code ");
             put_dec(a1);
@@ -355,6 +432,15 @@ pub fn run_guest(blob: &[u8]) -> ! {
     puts(b"..+2MiB -> HPA=");
     put_hex(guest_ram_hpa());
     put(b'\n');
+    // Stage 3: bring up the vGIC and inject the first virtual-timer interrupt, so the guest takes
+    // it as soon as it enables its CPU interface and unmasks IRQs.
+    gich_enable();
+    inject(VTIMER_INTID);
+    puts(b"[hyp] vGIC up (GICH enabled); guest GIC CPU iface = GICV @ IPA ");
+    put_hex(GUEST_GICC_IPA);
+    puts(b"; injected vINTID ");
+    put_dec(VTIMER_INTID);
+    put(b'\n');
     puts(b"[hyp] launching guest at EL1, entry IPA=");
     put_hex(entry);
     put(b'\n');
@@ -367,14 +453,15 @@ pub fn run_guest(blob: &[u8]) -> ! {
         asm!(
             "msr vbar_el2, {vbar}",
             "isb",
-            "msr hcr_el2, {hcr}",     // HCR_EL2.RW=1 (EL1 AArch64) | VM=1 (stage-2 enabled)
+            "msr hcr_el2, {hcr}",     // RW=1 (EL1 AArch64) | VM=1 (stage-2) | IMO=1 (route IRQs to
+                                      // EL2 and signal virtual IRQs from the vGIC to EL1)
             "msr sp_el1, {gsp}",
             "msr elr_el2, {entry}",
             "msr spsr_el2, {spsr}",   // EL1h, DAIF masked
             "isb",
             "eret",
             vbar = in(reg) vbar,
-            hcr = in(reg) 0x8000_0001u64,
+            hcr = in(reg) 0x8000_0011u64,
             gsp = in(reg) gsp,
             entry = in(reg) entry,
             spsr = in(reg) 0x3c5u64,

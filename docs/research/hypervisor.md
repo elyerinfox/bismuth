@@ -80,9 +80,19 @@ interrupt injection. Guest EL0<->EL1 syscalls run natively and never trap to EL2
   a later stage needs EL2-side cacheable state. **Verified in QEMU:** the guest R/W's its own
   stage-2 RAM, then a read of unmapped IPA `0x5000_0000` traps to EL2 ("stage-2 fault: guest
   read/write of unmapped IPA=0x50000000 — guest killed").
-- **S3 — vGIC + virtual timer.** Present the guest a GICv2/v3 it can program; inject virtual IRQs
-  (`ICH_*`/list registers); trap+offset `CNTV`/route `CNTVCT` so the guest timer works. Needed
-  before any interrupt-driven guest (i.e. any real OS).
+- **S3 — vGIC (DONE).** The hypervisor enables the GICv2 hypervisor interface (`GICH_HCR.En`),
+  seeds `GICH_VMCR` (virtual group enables + priority mask), and injects a virtual interrupt by
+  writing a **list register** (`GICH_LR0`: pending, Group 1, vINTID 27). Stage-2 maps the virtual
+  CPU interface **GICV** into the guest at the standard GICC IPA (`0x0801_0000`), so the guest
+  acknowledges/ends the interrupt through `GICV_AIAR`/`GICV_AEOIR` exactly as on real hardware;
+  `HCR_EL2.IMO=1` routes the vGIC's virtual IRQ to EL1. The guest installs a `VBAR_EL1` table,
+  unmasks (via `msr DAIF, xzr` — the immediate `daifclr` form was unreliable in this hand-assembly),
+  takes the IRQ, and re-arms the next tick with an `HVC_TICK` hypercall. QEMU-verified: the guest
+  takes four virtual-timer interrupts injected by the hypervisor, printing each via a hypercall.
+  *Simplification:* the tick cadence is driven by the guest's `HVC_TICK` (the hypervisor injects on
+  request) rather than a hardware `CNTV`/maintenance-interrupt loop at EL2 — that HW-timer-linked
+  path (trap/offset `CNTVOFF_EL2`, refill LRs on the maintenance IRQ) is the S3b/S4 refinement.
+  What is proven is the core vGIC mechanism: LR injection → GICV → guest IRQ handler → EOI.
 - **S4 — virtio-mmio backends.** Bismuth presents the guest virtio-mmio devices (console, block,
   net) whose rings live in guest-physical RAM; trap the guest's doorbell writes (stage-2 MMIO
   faults) and service the queues against Bismuth's real drivers/VFS/NIC. This is how the guest
