@@ -163,3 +163,25 @@ fn wasi_environ_sizes_get_reports_empty_environment() {
     // environ_sizes_get wrote count=0 at mem[0]; the function returns it.
     assert_eq!(m.invoke("e", &[]).unwrap(), Some(0));
 }
+
+// (func (export "i") (result i32)
+//   i64.const 4294967296  i64.const 3  i64.add  i32.wrap_i64)   ;; (2^32 + 3) wrapped = 3
+const I64: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // ()->i32
+    0x03, 0x02, 0x01, 0x00,
+    0x07, 0x05, 0x01, 0x01, b'i', 0x00, 0x00,
+    0x0a, 0x0e, 0x01, 0x0c, 0x00,
+    0x42, 0x80, 0x80, 0x80, 0x80, 0x10, // i64.const 2^32
+    0x42, 0x03, // i64.const 3
+    0x7c, // i64.add
+    0xa7, // i32.wrap_i64
+    0x0b,
+];
+
+#[test]
+fn sixty_four_bit_arithmetic() {
+    let m = Module::parse(I64).unwrap();
+    // 2^32 doesn't fit in i32 — a correct result proves real 64-bit values.
+    assert_eq!(m.invoke("i", &[]).unwrap(), Some(3));
+}

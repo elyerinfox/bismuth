@@ -233,13 +233,15 @@ impl Module {
                         }
                         let np = r.u32()?;
                         for _ in 0..np {
-                            if r.byte()? != 0x7f {
-                                return Err(Error::Unsupported); // i32 only
+                            let t = r.byte()?;
+                            if t != 0x7f && t != 0x7e {
+                                return Err(Error::Unsupported); // i32 / i64 value types
                             }
                         }
                         let nr = r.u32()?;
                         for _ in 0..nr {
-                            if r.byte()? != 0x7f {
+                            let t = r.byte()?;
+                            if t != 0x7f && t != 0x7e {
                                 return Err(Error::Unsupported);
                             }
                         }
@@ -286,7 +288,8 @@ impl Module {
             let mut n_locals = 0u32;
             for _ in 0..decls {
                 let cnt = lr.u32()?;
-                if lr.byte()? != 0x7f {
+                let t = lr.byte()?;
+                if t != 0x7f && t != 0x7e {
                     return Err(Error::Unsupported);
                 }
                 n_locals += cnt;
@@ -302,9 +305,10 @@ impl Module {
     pub fn invoke(&self, name: &str, args: &[i32]) -> Result<Option<i32>, Error> {
         let idx = self.exports.iter().find(|(n, _)| n == name).map(|(_, i)| *i).ok_or(Error::NotFound)?;
         let mut ctx = Ctx { mem: alloc::vec::from_elem(0u8, self.mem_pages as usize * PAGE), steps: 0, exit: None };
-        let r = self.call(idx, args, 0, &mut ctx)?;
-        // A `proc_exit` unwinds to here; surface its code as the result.
-        Ok(ctx.exit.map(Some).unwrap_or(r))
+        let a64: Vec<i64> = args.iter().map(|&x| x as i64).collect();
+        let r = self.call(idx, &a64, 0, &mut ctx)?;
+        // A `proc_exit` unwinds to here; surface its code as the result (truncating i64 to i32).
+        Ok(ctx.exit.map(Some).unwrap_or(r.map(|v| v as i32)))
     }
 
     /// Invoke the module's conventional WASI entry point (`_start`), returning the exit code.
@@ -315,7 +319,9 @@ impl Module {
         Ok(ctx.exit.unwrap_or(0))
     }
 
-    fn call(&self, fidx: u32, args: &[i32], depth: usize, ctx: &mut Ctx) -> Result<Option<i32>, Error> {
+    /// Values on the stack are 64-bit cells: `i32` occupies the low word (sign-extended), `i64`
+    /// the whole cell. This keeps one interpreter for both widths.
+    fn call(&self, fidx: u32, args: &[i64], depth: usize, ctx: &mut Ctx) -> Result<Option<i64>, Error> {
         if depth >= MAX_CALL_DEPTH {
             return Err(Error::NoResources);
         }
@@ -329,19 +335,19 @@ impl Module {
         if args.len() != nparams as usize {
             return Err(Error::Invalid);
         }
-        let mut locals = Vec::with_capacity(nparams as usize + f.n_locals as usize);
+        let mut locals: Vec<i64> = Vec::with_capacity(nparams as usize + f.n_locals as usize);
         locals.extend_from_slice(args);
         for _ in 0..f.n_locals {
             locals.push(0);
         }
-        let mut stack: Vec<i32> = Vec::new();
+        let mut stack: Vec<i64> = Vec::new();
         self.run(&f.body, &mut locals, &mut stack, depth, ctx)?;
         if nresults == 0 { Ok(None) } else { Ok(stack.pop()) }
     }
 
     /// A WASI host call (preview-1 subset): console I/O, exit, empty args/env, clock and random —
     /// enough to run a `wasm32-wasi` program's start-up and a `println!`-style workload.
-    fn host_call(&self, which: Host, args: &[i32], ctx: &mut Ctx) -> Result<Option<i32>, Error> {
+    fn host_call(&self, which: Host, args: &[i64], ctx: &mut Ctx) -> Result<Option<i64>, Error> {
         // Little-endian stores into linear memory, bounds-checked.
         let put32 = |ctx: &mut Ctx, at: usize, v: u32| {
             if at + 4 <= ctx.mem.len() {
@@ -350,20 +356,20 @@ impl Module {
         };
         match which {
             Host::ProcExit => {
-                ctx.exit = Some(*args.first().unwrap_or(&0));
+                ctx.exit = Some(*args.first().unwrap_or(&0) as i32);
                 Ok(None)
             }
             // No environment and no args: report zero counts/sizes; the *_get calls are no-ops.
             Host::EnvironSizesGet | Host::ArgsSizesGet => {
-                put32(ctx, args[0] as usize, 0); // count
-                put32(ctx, args[1] as usize, 0); // buffer size
+                put32(ctx, args[0] as u32 as usize, 0); // count
+                put32(ctx, args[1] as u32 as usize, 0); // buffer size
                 Ok(Some(0))
             }
             Host::EnvironGet | Host::ArgsGet => Ok(Some(0)),
             Host::ClockTimeGet => {
                 // clock_time_get(id, precision, time_ptr) -> errno; write nanoseconds since boot.
                 let ns = crate::kernel::time::ms_since_boot().saturating_mul(1_000_000);
-                let at = args[2] as usize;
+                let at = args[2] as u32 as usize;
                 if at + 8 <= ctx.mem.len() {
                     ctx.mem[at..at + 8].copy_from_slice(&ns.to_le_bytes());
                 }
@@ -372,7 +378,7 @@ impl Module {
             Host::RandomGet => {
                 // random_get(buf, buf_len) -> errno; fill with a SplitMix-style stream seeded from
                 // the monotonic clock (adequate for wasm; not a CSPRNG).
-                let (buf, len) = (args[0] as usize, args[1] as usize);
+                let (buf, len) = (args[0] as u32 as usize, args[1] as u32 as usize);
                 let mut x = crate::kernel::time::ms_since_boot().wrapping_add(0x9E37_79B9_7F4A_7C15);
                 for i in 0..len {
                     if buf + i >= ctx.mem.len() {
@@ -387,13 +393,14 @@ impl Module {
             }
             Host::FdRead => {
                 // fd_read(fd, iovs, iovs_len, nread) -> errno; no stdin → report 0 bytes (EOF).
-                put32(ctx, args[3] as usize, 0);
+                put32(ctx, args[3] as u32 as usize, 0);
                 Ok(Some(0))
             }
             Host::FdWrite => {
                 // fd_write(fd, iovs, iovs_len, nwritten) -> errno. Gather the iovecs from linear
                 // memory and write stdout/stderr (fd 1/2) to the kernel console.
-                let (fd, iovs, iovs_len, nwritten) = (args[0], args[1] as usize, args[2] as usize, args[3] as usize);
+                let (fd, iovs, iovs_len, nwritten) =
+                    (args[0] as i32, args[1] as u32 as usize, args[2] as u32 as usize, args[3] as u32 as usize);
                 let mem = &ctx.mem;
                 let rd = |o: usize| -> u32 {
                     u32::from_le_bytes([mem[o], mem[o + 1], mem[o + 2], mem[o + 3]])
@@ -427,7 +434,7 @@ impl Module {
 
     /// Execute a function body. Structured control flow is handled with a control stack of
     /// `(is_loop, stack_height_at_entry, start_pc, end_pc)`; `br`/`br_if`/`return` unwind it.
-    fn run(&self, body: &[u8], locals: &mut [i32], stack: &mut Vec<i32>, depth: usize, ctx: &mut Ctx) -> Result<(), Error> {
+    fn run(&self, body: &[u8], locals: &mut [i64], stack: &mut Vec<i64>, depth: usize, ctx: &mut Ctx) -> Result<(), Error> {
         let mut ctrl: Vec<Ctrl> = Vec::new();
         let mut pc = 0usize;
         loop {
@@ -450,7 +457,7 @@ impl Module {
                     // A branch to a loop targets its params (none here); to a block/if, its
                     // results — one value for blocktype `i32` (0x7f), none for empty (0x40).
                     let is_loop = op == 0x03;
-                    let br_arity = if !is_loop && bt == 0x7f { 1 } else { 0 };
+                    let br_arity = if !is_loop && (bt == 0x7f || bt == 0x7e) { 1 } else { 0 };
                     if op == 0x04 {
                         // if: pop the condition; on false, jump past `else`/to `end`.
                         let c = stack.pop().ok_or(Error::Invalid)?;
@@ -501,7 +508,7 @@ impl Module {
                     };
                     let (np, _) = *self.types.get(type_idx as usize).ok_or(Error::Invalid)?;
                     let at = stack.len().checked_sub(np as usize).ok_or(Error::Invalid)?;
-                    let callee_args: Vec<i32> = stack.split_off(at);
+                    let callee_args: Vec<i64> = stack.split_off(at);
                     if let Some(r) = self.call(f, &callee_args, depth + 1, ctx)? {
                         stack.push(r);
                     }
@@ -538,10 +545,20 @@ impl Module {
                 0x41 => {
                     let (v, n) = sleb(body, pc)?;
                     pc += n;
-                    stack.push(v as i32);
+                    stack.push(v as i32 as i64); // i32.const (sign-extended into the 64-bit cell)
+                }
+                0x42 => {
+                    let (v, n) = sleb(body, pc)?;
+                    pc += n;
+                    stack.push(v); // i64.const
                 }
                 0x45 => unary(stack, |a| (a == 0) as i32)?,
                 0x46..=0x4f => cmp(stack, op)?,
+                0x50 => {
+                    let a = stack.pop().ok_or(Error::Invalid)?;
+                    stack.push((a == 0) as i64); // i64.eqz
+                }
+                0x51..=0x5a => cmp64(stack, op)?,
                 // Linear-memory loads: memarg = align(uleb) + offset(uleb); addr = base + offset.
                 0x28 | 0x2c | 0x2d | 0x2e | 0x2f => {
                     pc += uleb_at(body, pc)?.1; // align (ignored)
@@ -557,32 +574,58 @@ impl Module {
                         0x2e => (i16::from_le_bytes([*m.get(a).ok_or(Error::Invalid)?, m[a + 1]])) as i32,
                         _ => u16::from_le_bytes([*m.get(a).ok_or(Error::Invalid)?, m[a + 1]]) as i32,
                     };
+                    stack.push(v as i64);
+                }
+                // i64.load (0x29) and its narrowing variants (0x30..=0x35).
+                0x29 | 0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 => {
+                    pc += uleb_at(body, pc)?.1;
+                    let (off, n) = uleb_at(body, pc)?;
+                    pc += n;
+                    let base = stack.pop().ok_or(Error::Invalid)? as u32 as usize;
+                    let a = base + off as usize;
+                    let m = &ctx.mem;
+                    let g = |i: usize| m.get(i).copied().ok_or(Error::Invalid);
+                    let v: i64 = match op {
+                        0x29 => i64::from_le_bytes([g(a)?, g(a + 1)?, g(a + 2)?, g(a + 3)?, g(a + 4)?, g(a + 5)?, g(a + 6)?, g(a + 7)?]),
+                        0x30 => (g(a)? as i8) as i64,
+                        0x31 => g(a)? as i64,
+                        0x32 => i16::from_le_bytes([g(a)?, g(a + 1)?]) as i64,
+                        0x33 => u16::from_le_bytes([g(a)?, g(a + 1)?]) as i64,
+                        0x34 => i32::from_le_bytes([g(a)?, g(a + 1)?, g(a + 2)?, g(a + 3)?]) as i64,
+                        _ => u32::from_le_bytes([g(a)?, g(a + 1)?, g(a + 2)?, g(a + 3)?]) as i64,
+                    };
                     stack.push(v);
                 }
-                // Linear-memory stores.
-                0x36 | 0x3a | 0x3b => {
+                // Linear-memory stores (i32: 0x36/0x3a/0x3b, i64: 0x37/0x3c/0x3d/0x3e).
+                0x36 | 0x3a | 0x3b | 0x37 | 0x3c | 0x3d | 0x3e => {
                     pc += uleb_at(body, pc)?.1;
                     let (off, n) = uleb_at(body, pc)?;
                     pc += n;
                     let v = stack.pop().ok_or(Error::Invalid)?;
                     let base = stack.pop().ok_or(Error::Invalid)? as u32 as usize;
                     let a = base + off as usize;
+                    let w = |mem: &mut Vec<u8>, at: usize, bytes: &[u8]| -> Result<(), Error> {
+                        mem.get_mut(at..at + bytes.len()).ok_or(Error::Invalid)?.copy_from_slice(bytes);
+                        Ok(())
+                    };
                     match op {
-                        0x36 => ctx.mem.get_mut(a..a + 4).ok_or(Error::Invalid)?.copy_from_slice(&v.to_le_bytes()),
-                        0x3a => *ctx.mem.get_mut(a).ok_or(Error::Invalid)? = v as u8,
-                        _ => ctx.mem.get_mut(a..a + 2).ok_or(Error::Invalid)?.copy_from_slice(&(v as u16).to_le_bytes()),
+                        0x36 => w(&mut ctx.mem, a, &(v as i32).to_le_bytes())?,
+                        0x3a | 0x3c => *ctx.mem.get_mut(a).ok_or(Error::Invalid)? = v as u8,
+                        0x3b | 0x3d => w(&mut ctx.mem, a, &(v as u16).to_le_bytes())?,
+                        0x37 => w(&mut ctx.mem, a, &v.to_le_bytes())?,
+                        _ => w(&mut ctx.mem, a, &(v as u32).to_le_bytes())?, // 0x3e i64.store32
                     }
                 }
                 0x3f => {
                     pc += 1; // memory index 0x00
-                    stack.push((ctx.mem.len() / PAGE) as i32);
+                    stack.push((ctx.mem.len() / PAGE) as i64);
                 }
                 0x40 => {
                     pc += 1;
                     let grow = stack.pop().ok_or(Error::Invalid)? as u32 as usize;
                     let old = ctx.mem.len() / PAGE;
                     ctx.mem.resize((old + grow) * PAGE, 0);
-                    stack.push(old as i32);
+                    stack.push(old as i64);
                 }
                 0x67..=0x69 => unary(stack, |a| match op {
                     0x67 => a.leading_zeros() as i32,
@@ -590,21 +633,35 @@ impl Module {
                     _ => a.count_ones() as i32,
                 })?,
                 0x6a..=0x78 => binop(stack, op)?,
+                0x7c..=0x8a => binop64(stack, op)?,
+                0xa7 => {
+                    let v = stack.pop().ok_or(Error::Invalid)?;
+                    stack.push((v as i32) as i64); // i32.wrap_i64
+                }
+                0xac => {
+                    let v = stack.pop().ok_or(Error::Invalid)?;
+                    stack.push((v as i32) as i64); // i64.extend_i32_s
+                }
+                0xad => {
+                    let v = stack.pop().ok_or(Error::Invalid)?;
+                    stack.push((v as u32) as i64); // i64.extend_i32_u
+                }
                 _ => return Err(Error::Unsupported),
             }
         }
     }
 }
 
-fn unary(stack: &mut Vec<i32>, f: impl Fn(i32) -> i32) -> Result<(), Error> {
-    let a = stack.pop().ok_or(Error::Invalid)?;
-    stack.push(f(a));
+// Value cells are 64-bit; `i32` ops read/write the low word (sign-extended back into the cell).
+fn unary(stack: &mut Vec<i64>, f: impl Fn(i32) -> i32) -> Result<(), Error> {
+    let a = stack.pop().ok_or(Error::Invalid)? as i32;
+    stack.push(f(a) as i64);
     Ok(())
 }
 
-fn cmp(stack: &mut Vec<i32>, op: u8) -> Result<(), Error> {
-    let b = stack.pop().ok_or(Error::Invalid)?;
-    let a = stack.pop().ok_or(Error::Invalid)?;
+fn cmp(stack: &mut Vec<i64>, op: u8) -> Result<(), Error> {
+    let b = stack.pop().ok_or(Error::Invalid)? as i32;
+    let a = stack.pop().ok_or(Error::Invalid)? as i32;
     let r = match op {
         0x46 => a == b,
         0x47 => a != b,
@@ -618,14 +675,34 @@ fn cmp(stack: &mut Vec<i32>, op: u8) -> Result<(), Error> {
         0x4f => (a as u32) >= (b as u32),
         _ => return Err(Error::Unsupported),
     };
-    stack.push(r as i32);
+    stack.push(r as i64);
     Ok(())
 }
 
-fn binop(stack: &mut Vec<i32>, op: u8) -> Result<(), Error> {
+fn cmp64(stack: &mut Vec<i64>, op: u8) -> Result<(), Error> {
     let b = stack.pop().ok_or(Error::Invalid)?;
     let a = stack.pop().ok_or(Error::Invalid)?;
     let r = match op {
+        0x51 => a == b,
+        0x52 => a != b,
+        0x53 => a < b,
+        0x54 => (a as u64) < (b as u64),
+        0x55 => a > b,
+        0x56 => (a as u64) > (b as u64),
+        0x57 => a <= b,
+        0x58 => (a as u64) <= (b as u64),
+        0x59 => a >= b,
+        0x5a => (a as u64) >= (b as u64),
+        _ => return Err(Error::Unsupported),
+    };
+    stack.push(r as i64);
+    Ok(())
+}
+
+fn binop(stack: &mut Vec<i64>, op: u8) -> Result<(), Error> {
+    let b = stack.pop().ok_or(Error::Invalid)? as i32;
+    let a = stack.pop().ok_or(Error::Invalid)? as i32;
+    let r: i32 = match op {
         0x6a => a.wrapping_add(b),
         0x6b => a.wrapping_sub(b),
         0x6c => a.wrapping_mul(b),
@@ -641,6 +718,31 @@ fn binop(stack: &mut Vec<i32>, op: u8) -> Result<(), Error> {
         0x76 => ((a as u32).wrapping_shr(b as u32)) as i32,
         0x77 => a.rotate_left(b as u32),
         0x78 => a.rotate_right(b as u32),
+        _ => return Err(Error::Unsupported),
+    };
+    stack.push(r as i64);
+    Ok(())
+}
+
+fn binop64(stack: &mut Vec<i64>, op: u8) -> Result<(), Error> {
+    let b = stack.pop().ok_or(Error::Invalid)?;
+    let a = stack.pop().ok_or(Error::Invalid)?;
+    let r: i64 = match op {
+        0x7c => a.wrapping_add(b),
+        0x7d => a.wrapping_sub(b),
+        0x7e => a.wrapping_mul(b),
+        0x7f => a.checked_div(b).ok_or(Error::Invalid)?,
+        0x80 => (a as u64).checked_div(b as u64).ok_or(Error::Invalid)? as i64,
+        0x81 => a.checked_rem(b).ok_or(Error::Invalid)?,
+        0x82 => (a as u64).checked_rem(b as u64).ok_or(Error::Invalid)? as i64,
+        0x83 => a & b,
+        0x84 => a | b,
+        0x85 => a ^ b,
+        0x86 => a.wrapping_shl(b as u32),
+        0x87 => a.wrapping_shr(b as u32),
+        0x88 => ((a as u64).wrapping_shr(b as u32)) as i64,
+        0x89 => a.rotate_left(b as u32),
+        0x8a => a.rotate_right(b as u32),
         _ => return Err(Error::Unsupported),
     };
     stack.push(r);
@@ -661,7 +763,7 @@ struct Ctrl {
 }
 
 /// Branch out of (break) or back into (loop continue) the `l`-th enclosing control frame.
-fn branch(stack: &mut Vec<i32>, ctrl: &mut Vec<Ctrl>, l: usize, pc: &mut usize) -> Result<(), Error> {
+fn branch(stack: &mut Vec<i64>, ctrl: &mut Vec<Ctrl>, l: usize, pc: &mut usize) -> Result<(), Error> {
     let target = ctrl.len().checked_sub(1 + l).ok_or(Error::Invalid)?;
     let (is_loop, height, arity, start, end) = {
         let f = &ctrl[target];
@@ -669,7 +771,7 @@ fn branch(stack: &mut Vec<i32>, ctrl: &mut Vec<Ctrl>, l: usize, pc: &mut usize) 
     };
     // Keep the top `arity` values; discard everything the block pushed below them.
     let keep_from = stack.len().checked_sub(arity).ok_or(Error::Invalid)?;
-    let kept: Vec<i32> = stack.split_off(keep_from);
+    let kept: Vec<i64> = stack.split_off(keep_from);
     stack.truncate(height);
     stack.extend_from_slice(&kept);
     if is_loop {
@@ -689,7 +791,7 @@ fn skip(body: &[u8], pc: usize) -> Result<usize, Error> {
     match op {
         0x02 | 0x03 | 0x04 => p += 1,                       // blocktype
         0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 => p += uleb_at(body, p)?.1, // one uleb
-        0x41 => p += sleb(body, p)?.1,                      // i32.const
+        0x41 | 0x42 => p += sleb(body, p)?.1,               // i32.const / i64.const
         0x28..=0x3e => {
             // load/store memarg: align uleb + offset uleb
             p += uleb_at(body, p)?.1;
