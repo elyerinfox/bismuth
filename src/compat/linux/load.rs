@@ -183,6 +183,17 @@ pub fn load_and_run(bin: &[u8], name: &'static str, prio: u8, domain: DomainId) 
     });
     let Some(i) = i else { return Err(Error::NoResources) };
 
+    // If the domain is a container, charge its memory cgroup for the resident process footprint
+    // (the whole address-space buffer); a limit smaller than the process is refused here.
+    #[cfg(feature = "containers")]
+    match security::container::charge_mem(security::container::ContainerId(domain), IMAGE_BYTES as u32) {
+        Ok(()) | Err(Error::NotFound) => {} // charged, or not a container (no cgroup)
+        Err(e) => {
+            PROCS.lock(|p| p[i].used = false);
+            return Err(e);
+        }
+    }
+
     // A previous run may have left this buffer's code pages EL0 read-only (also EL1 read-only on
     // this MMU); restore the whole buffer to read-write before we rewrite it.
     let image_addr = IMAGES[i].lock(|img| img.0.as_ptr() as u64);

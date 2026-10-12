@@ -542,6 +542,11 @@ fn linux_monitor(_: usize) {
             break;
         }
     }
+    // Memory cgroup: each Linux container was charged for its resident process footprint.
+    container::for_each(|c, decl| {
+        kprintln!("[cgroup] {}: memory.current={} / memory.max={}", decl.name(), container::mem_used(c), decl.ram_bytes);
+    });
+
     // The 'lxwrite' container created a file in the shared VFS; read it back to prove its write
     // persisted (container storage).
     if let Ok(f) = fs::open("/output.txt", OpenMode::READ) {
