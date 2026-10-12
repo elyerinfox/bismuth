@@ -35,12 +35,6 @@ mod linux_mmap;
 static LINUXFS: bismuth::fs::RamFs<16, 64, 64> = bismuth::fs::RamFs::new();
 #[cfg(feature = "linux-demo")]
 static SLX: Stack<16384> = Stack::new();
-#[cfg(feature = "linux-demo")]
-static LX_D1: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "linux-demo")]
-static LX_D2: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "linux-demo")]
-static LX_D3: AtomicU32 = AtomicU32::new(0);
 
 /// The one place hardware addresses are asserted. QEMU `virt`: PL011 UART0 at 0x0900_0000,
 /// routed to GIC SPI 1 (interrupt 32 + 1).
@@ -405,76 +399,125 @@ pub extern "C" fn kernel_main() -> ! {
     }
 }
 
-/// The Linux-ABI demo: load a hand-assembled aarch64 Linux ELF — `write(1, "Hello…", N); exit(0)`
-/// — into an EL0-exec buffer and run it as a sandboxed task. Its `svc #0` with Linux numbers in
-/// `x8` routes through the `linux-abi` personality: `write` reaches the console, `exit` retires
-/// the task. A watchdog then exits QEMU so the run terminates cleanly.
+// Launcher stacks for the three Linux containers' privileged entry tasks.
+#[cfg(feature = "linux-demo")]
+static LXS1: Stack<8192> = Stack::new();
+#[cfg(feature = "linux-demo")]
+static LXS2: Stack<8192> = Stack::new();
+#[cfg(feature = "linux-demo")]
+static LXS3: Stack<8192> = Stack::new();
+
+/// A container's root task: load its Linux binary and enter it at EL0 in this container's domain.
+/// The launcher returns once the EL0 task is spawned; the container lives until that task exits.
+#[cfg(feature = "linux-demo")]
+fn lx_launch(bin: &'static [u8], name: &'static str) {
+    if let Err(e) = bismuth::compat::linux::load::load_and_run(bin, name, 2, security::current()) {
+        kprintln!("[{name}] load failed: {e:?}");
+    }
+}
+#[cfg(feature = "linux-demo")]
+fn lx_hello(_: usize) {
+    lx_launch(&linux_elf::HELLO_ELF, "hello");
+}
+#[cfg(feature = "linux-demo")]
+fn lx_cat(_: usize) {
+    lx_launch(&linux_cat::CAT_ELF, "cat");
+}
+#[cfg(feature = "linux-demo")]
+fn lx_mmap(_: usize) {
+    lx_launch(&linux_mmap::MMAP_ELF, "mmap");
+}
+
+/// Three Linux binaries, each packaged as a container: an isolated domain (two task slots: the
+/// launcher + the EL0 Linux task), a privileged launcher entry, and — for the file reader — a
+/// declarative directory grant confining it to the mounted root.
+#[cfg(feature = "linux-demo")]
+static LINUX_MANIFEST: bismuth::security::container::ContainerManifest = {
+    use bismuth::security::container::{ContainerDecl, ContainerEntry, ContainerManifest, OnFault};
+    use bismuth::security::manifest::{DirGrantDecl, DomainDecl};
+    ContainerManifest {
+        containers: &[
+            ContainerDecl {
+                domain: DomainDecl { spec: DomainSpec::isolated("lxhello", 4, 2), grants: &[], dirs: &[] },
+                entry: ContainerEntry::privileged(lx_hello, 3, &LXS1),
+                version: 1,
+                cpu: None,
+                ram_bytes: 131072,
+                on_fault: OnFault::Stop,
+                image_hash: [0; 32],
+            },
+            ContainerDecl {
+                domain: DomainDecl {
+                    spec: DomainSpec::isolated("lxcat", 4, 2),
+                    grants: &[],
+                    dirs: &[DirGrantDecl { path: "/", name: "root", rights: Rights::READ }],
+                },
+                entry: ContainerEntry::privileged(lx_cat, 3, &LXS2),
+                version: 1,
+                cpu: None,
+                ram_bytes: 131072,
+                on_fault: OnFault::Stop,
+                image_hash: [0; 32],
+            },
+            ContainerDecl {
+                domain: DomainDecl { spec: DomainSpec::isolated("lxmmap", 4, 2), grants: &[], dirs: &[] },
+                entry: ContainerEntry::privileged(lx_mmap, 3, &LXS3),
+                version: 1,
+                cpu: None,
+                ram_bytes: 131072,
+                on_fault: OnFault::Stop,
+                image_hash: [0; 32],
+            },
+        ],
+        supervisor: None,
+    }
+};
+
+/// The Linux-ABI demo: run three hand-assembled aarch64 Linux binaries **as containers** — each an
+/// isolated, capability-confined domain managed by the container runtime. A write loop, a file
+/// reader (openat/read/write against a VFS directory granted to its container), and a heap
+/// allocator (mmap). `install` creates the domains + applies the grants + seals; `start` spawns
+/// each container's launcher, which enters the Linux binary at EL0.
 #[cfg(all(not(feature = "net-demo"), feature = "linux-demo"))]
 fn linux_demo() {
     use bismuth::fs::{self, OpenMode};
-    kprintln!("Bismuth {} on QEMU virt — Linux-ABI demo (EL0 Linux binaries)", env!("CARGO_PKG_VERSION"));
+    use bismuth::security::container;
+    kprintln!("Bismuth {} on QEMU virt — Linux binaries as containers", env!("CARGO_PKG_VERSION"));
 
-    // Seed a file the second Linux binary will read through the VFS.
+    // Seed a file the "lxcat" container will read through its granted VFS root.
     LINUXFS.format();
     fs::mount("/", &LINUXFS).unwrap();
     let f = fs::open("/greeting.txt", OpenMode::RDWR.with(OpenMode::CREATE)).unwrap();
-    fs::write(f, b"[file] Hello from a VFS file, read by a Linux binary at EL0!\n").unwrap();
+    fs::write(f, b"[file] Hello from a VFS file, read by a Linux container at EL0!\n").unwrap();
     fs::close(f);
 
-    // Two sandboxed domains: a normal `exit` tears its domain down, so each binary gets its own.
-    let d1 = security::create_domain(DomainSpec::sandboxed("linux1", 4, 1)).unwrap();
-    let d2 = security::create_domain(DomainSpec::sandboxed("linux2", 4, 1)).unwrap();
-    let d3 = security::create_domain(DomainSpec::sandboxed("linux3", 4, 1)).unwrap();
-    fs::grant_dir(d2, "/", Rights::READ, "root").unwrap(); // the file reader's confined root
-    security::seal().unwrap();
-    LX_D1.store(d1.0 as u32, Ordering::Relaxed);
-    LX_D2.store(d2.0 as u32, Ordering::Relaxed);
-    LX_D3.store(d3.0 as u32, Ordering::Relaxed);
-    task::spawn("linuxdrv", 1, &SLX, linux_driver, 0).unwrap();
+    container::install(&LINUX_MANIFEST).unwrap(); // creates domains, applies dir grants, seals
+    for name in ["lxhello", "lxcat", "lxmmap"] {
+        let c = container::find(name).unwrap();
+        kprintln!("[linux] starting container '{name}'");
+        container::start(c).unwrap();
+    }
+    task::spawn("linuxmon", 1, &SLX, linux_monitor, 0).unwrap();
 }
 
-/// Run the two hand-assembled Linux binaries in turn, then report and exit.
+/// Wait for the three Linux containers to run their binaries to `exit`, then report and quit.
 #[cfg(all(not(feature = "net-demo"), feature = "linux-demo"))]
-fn linux_driver(_: usize) {
-    use bismuth::compat::linux::load::load_and_run;
-    let d1 = DomainId(LX_D1.load(Ordering::Relaxed) as u8);
-    let d2 = DomainId(LX_D2.load(Ordering::Relaxed) as u8);
-
-    kprintln!("[linux] #1: a write-loop binary");
-    match load_and_run(&linux_elf::HELLO_ELF, "hello", 2, d1) {
-        Ok(t) => {
-            let _ = task::join(t, Timeout::ms(5000));
-        }
-        Err(e) => {
-            kprintln!("[linux] #1 load failed: {e:?}");
-            bismuth::arch::aarch64::qemu_exit(1);
-        }
-    }
-
-    kprintln!("[linux] #2: a binary that openat()+read()s a VFS file and writes it to stdout");
-    match load_and_run(&linux_cat::CAT_ELF, "cat", 2, d2) {
-        Ok(t) => {
-            let _ = task::join(t, Timeout::ms(5000));
-        }
-        Err(e) => {
-            kprintln!("[linux] #2 load failed: {e:?}");
-            bismuth::arch::aarch64::qemu_exit(1);
+fn linux_monitor(_: usize) {
+    use bismuth::security::{self, container};
+    // The binaries are tiny; give them time to run and exit (each exit tears its domain down).
+    for _ in 0..50 {
+        task::sleep_ticks(10);
+        let mut done = 0;
+        container::for_each(|c, _| {
+            if security::is_killed(c.0) {
+                done += 1;
+            }
+        });
+        if done == 3 {
+            break;
         }
     }
-
-    let d3 = DomainId(LX_D3.load(Ordering::Relaxed) as u8);
-    kprintln!("[linux] #3: a binary that mmap()s a page, fills it, and writes it");
-    match load_and_run(&linux_mmap::MMAP_ELF, "mmap", 2, d3) {
-        Ok(t) => {
-            let _ = task::join(t, Timeout::ms(5000));
-        }
-        Err(e) => {
-            kprintln!("[linux] #3 load failed: {e:?}");
-            bismuth::arch::aarch64::qemu_exit(1);
-        }
-    }
-
-    kprintln!("aarch64 Linux-ABI demo complete: three EL0 Linux binaries ran — a write loop, a VFS file reader (openat/read/write), and a heap allocator (mmap). PASS");
+    kprintln!("aarch64 Linux-container demo complete: three Linux binaries ran as containers — write loop, VFS file reader, heap allocator. PASS");
     bismuth::arch::aarch64::qemu_exit(0);
 }
 

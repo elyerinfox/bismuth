@@ -276,6 +276,15 @@ pub fn install(m: &'static ContainerManifest) -> Result<(), Error> {
             let dev = crate::driver::Device::find(g.device)?;
             super::grant_device(id, dev, g.rights, g.name)?;
         }
+        // Declarative directory grants (the container's confined filesystem view).
+        #[cfg(feature = "fs")]
+        for g in c.domain.dirs {
+            crate::fs::grant_dir(id, g.path, g.rights, g.name)?;
+        }
+        #[cfg(not(feature = "fs"))]
+        if !c.domain.dirs.is_empty() {
+            return Err(Error::Unsupported);
+        }
         TABLE.lock(|t| t[id.0 as usize] = Some(c));
         // Push the CPU budget down to the scheduler (L1), converting µs/ms → ticks.
         if let Some(b) = c.cpu {
