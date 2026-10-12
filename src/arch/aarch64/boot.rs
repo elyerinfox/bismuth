@@ -17,6 +17,7 @@
 use core::arch::naked_asm;
 
 /// Reset entry. Placed first in `.text.boot` by the board linker script; `ENTRY(_start)`.
+#[cfg(not(feature = "hypervisor"))]
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.boot")]
@@ -98,15 +99,61 @@ unsafe extern "C" {
     /// The board's entry, run at EL1 with the MMU on. Provided with `#[no_mangle]`.
     fn kernel_main() -> !;
     /// The board's memory layout, read before the MMU/GIC are set up. `#[no_mangle]`.
+    /// (Unused in the `hypervisor` build, which stays at EL2 and skips MMU/GIC bring-up.)
+    #[cfg(not(feature = "hypervisor"))]
     fn bismuth_board_map() -> BoardMap;
 }
 
+#[cfg(not(feature = "hypervisor"))]
 extern "C" fn rust_boot() -> ! {
     // SAFETY: the board provides `bismuth_board_map`.
     let m = unsafe { bismuth_board_map() };
     super::intc::set_kind(m.intc as u32);
     super::gic::set_bases(m.gicd as usize, m.gicc as usize);
     super::paging::build((m.ram_base, m.ram_size), (m.periph_base, m.periph_size));
+    // SAFETY: the board provides `kernel_main`; we never return from it.
+    unsafe { kernel_main() }
+}
+
+/// Reset entry for the `hypervisor` feature: **stay at EL2** (do not drop to EL1) and hand off to
+/// the board's `kernel_main`, which runs the EL2 hypervisor shim ([`super::hyp`]). QEMU `virt`
+/// with `virtualization=on` enters here at EL2. The MMU is left off in stage 1 (see `hyp`).
+#[cfg(feature = "hypervisor")]
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".text.boot")]
+pub extern "C" fn _start() -> ! {
+    naked_asm!(
+        // Only core 0 proceeds; park the rest.
+        "mrs x0, mpidr_el1",
+        "and x0, x0, #0xff",
+        "cbnz x0, 9f",
+        // Stay at the entry EL (EL2 on QEMU `virt,virtualization=on`): set SP, zero .bss, go.
+        "adrp x0, __stack_top",
+        "add x0, x0, :lo12:__stack_top",
+        "mov sp, x0",
+        "adrp x0, __bss_start",
+        "add x0, x0, :lo12:__bss_start",
+        "adrp x1, __bss_end",
+        "add x1, x1, :lo12:__bss_end",
+        "2:",
+        "cmp x0, x1",
+        "b.hs 3f",
+        "str xzr, [x0], #8",
+        "b 2b",
+        "3:",
+        "bl {boot}",
+        "9:",
+        "wfe",
+        "b 9b",
+        boot = sym rust_boot_hyp,
+    )
+}
+
+/// EL2 Rust entry for the hypervisor build: hand off to the board's `kernel_main` (which calls
+/// the EL2 shim). No MMU/GIC bring-up here — stage 1 runs with the MMU off.
+#[cfg(feature = "hypervisor")]
+extern "C" fn rust_boot_hyp() -> ! {
     // SAFETY: the board provides `kernel_main`; we never return from it.
     unsafe { kernel_main() }
 }

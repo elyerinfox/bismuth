@@ -12,11 +12,14 @@
 // `net-demo` networking flow, and the `interactive` container host + shell — so whichever is not
 // selected is legitimately unused in that build.
 #![cfg_attr(
-    any(feature = "net-demo", feature = "interactive", feature = "linux-demo"),
+    any(feature = "net-demo", feature = "interactive", feature = "linux-demo", feature = "hypervisor"),
     allow(dead_code, unused_imports)
 )]
 
 use core::sync::atomic::{AtomicU32, Ordering};
+
+#[cfg(feature = "hypervisor")]
+mod hv_guest;
 
 use bismuth::arch::mmio::Mmio;
 use bismuth::driver::sensor::SimSensor;
@@ -364,6 +367,22 @@ fn container_host() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main() -> ! {
+    // The `hypervisor` build stays at EL2 and runs the hypervisor shim (a hand-assembled guest at
+    // EL1 + its HVC hypercalls) instead of the normal EL1 kernel. Everything below is the EL1
+    // path, compiled out in that build.
+    #[cfg(feature = "hypervisor")]
+    {
+        bismuth::arch::aarch64::hyp::run_guest(&hv_guest::GUEST)
+    }
+    #[cfg(not(feature = "hypervisor"))]
+    {
+        kernel_main_el1()
+    }
+}
+
+/// The normal EL1 kernel entry (all non-hypervisor board flows).
+#[cfg(not(feature = "hypervisor"))]
+fn kernel_main_el1() -> ! {
     driver::probe_all(&BOARD, FACTORIES);
     if let Ok(uart) = Device::find("uart0") {
         bismuth::console::set_device(uart);

@@ -28,6 +28,10 @@ net-demo = []
 # `linux-abi` personality — it prints via the Linux `write` syscall and exits via `exit`.
 # Build/run with `cargo run --features linux-demo`.
 linux-demo = ["bismuth-kernel/linux-abi"]
+# When set, the board stays at EL2 and runs the type-1 hypervisor shim: a hand-assembled guest
+# runs at EL1 and prints through an HVC hypercall. Build/run with `bash run-hv.sh` (needs QEMU
+# `-M virt,virtualization=on`).
+hypervisor = ["bismuth-kernel/hypervisor"]
 
 [profile.dev]
 panic = "abort"

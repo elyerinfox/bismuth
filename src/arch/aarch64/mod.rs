@@ -32,6 +32,8 @@ pub mod exceptions;
 pub use boot::BoardMap;
 
 pub mod gic;
+#[cfg(feature = "hypervisor")]
+pub mod hyp;
 pub mod intc;
 pub mod paging;
 pub mod sw;

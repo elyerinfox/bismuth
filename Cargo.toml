@@ -63,6 +63,10 @@ wasm = ["heap"]
 linux-abi = []
 # Trusted platform: TPM/secure-element root of trust, measured boot, sealing, attestation.
 tpm = ["crypto"]
+# Type-1 hypervisor (staged, aarch64 only): the reset path stays at EL2 and hosts guest VMs
+# instead of dropping to EL1. Stage 1 runs a hand-assembled guest at EL1 and services its HVC
+# hypercalls. OFF by default — when off, the normal EL1 kernel is byte-for-byte unchanged.
+hypervisor = []
 
 [dependencies]
 embedded-hal = { version = "1.0.0", optional = true }

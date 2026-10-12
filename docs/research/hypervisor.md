@@ -1,0 +1,106 @@
+# Bismuth as a type-1 hypervisor (aarch64)
+
+Status: **stage 1 landed** (EL2 boot + a guest at EL1 + an HVC hypercall round-trip, QEMU-verified).
+This doc records the architecture, the model decision, and the staged roadmap toward hosting a
+real guest OS — the one remaining path to running an *unmodified* Linux/Docker distribution on
+Bismuth (as opposed to the Linux-ABI personality, which runs Linux *binaries* at EL0 under the
+Bismuth kernel).
+
+## Why a hypervisor, and how it differs from the Linux-ABI path
+
+Bismuth already runs Linux executables via two routes that do **not** need a hypervisor:
+
+- the **Linux-ABI personality** (`linux-abi`): loads an aarch64 Linux ELF, runs it at EL0 under the
+  Bismuth kernel, and emulates Linux syscalls (`openat`/`mmap`/`getdents64`/…). Good for a single
+  static binary; it is *not* a whole distro and has no Linux kernel.
+- the **native / WASM container runtimes**: Bismuth's own isolation model.
+
+A *literal* `docker run ubuntu` boots a real **Linux kernel** plus a userland. The only faithful
+way to host that on Bismuth is a **virtual machine**: Bismuth runs at **EL2** as a type-1
+hypervisor, the guest Linux kernel runs at **EL1**, guest userland at **EL0**, and the guest's
+own CPU/MMU/syscalls run natively while Bismuth mediates physical memory (stage-2 translation),
+interrupts (vGIC), the timer, and I/O (virtio backends).
+
+## Model decision: thin EL2 shim, Bismuth core stays EL1
+
+Two shapes were considered:
+
+1. **Move the whole Bismuth kernel to EL2** and run everything (RTOS tasks + guests) there.
+2. **Keep the Bismuth RTOS at EL1; add a thin EL2 shim** that only does VM hosting, entered when
+   a VM is created.
+
+**Recommendation: (2) — a thin EL2 shim, Bismuth core stays EL1.** Rationale for an RTOS:
+
+- The RTOS scheduler, drivers, and the whole verified EL0-isolation/stack machinery are written
+  and tested against EL1/EL0. Hoisting them to EL2/EL1 would re-open every one of those seams for
+  no RTOS benefit.
+- Real-time guarantees: the hypervisor shim should be *small and bounded* (trap, service, return),
+  not the home of the general scheduler. A fat EL2 is a worse-bounded TCB.
+- An RTOS's job is determinism for its native tasks; VMs are an *add-on*. Keeping them to a narrow
+  EL2 shim keeps the hot paths (RTOS) unchanged and the VM paths isolated and optional.
+
+The `hypervisor` feature is therefore **off by default**: a normal build is byte-for-byte the EL1
+kernel. Only a hypervisor build keeps EL2 and brings the shim up. (Stage 1, below, runs *only* the
+shim at EL2 to prove the mechanism; stages 4–5 wire the EL1 RTOS and the EL2 shim to coexist, with
+the RTOS owning the cores and the shim entered to run a guest time-slice.)
+
+## EL exception model (aarch64, `virt,virtualization=on`)
+
+```
+EL2  Bismuth hypervisor shim  (VBAR_EL2, HCR_EL2, stage-2 tables, vGIC, virtio backends)
+ |                 ^ traps: HVC, stage-2 faults, trapped sysreg/WFx, virtual IRQ inject
+ v eret            |
+EL1  guest OS kernel          (its own VBAR_EL1 / TTBR_EL1 / sctlr)
+ |                 ^ guest syscalls stay within the guest (EL0<->EL1), Bismuth never sees them
+ v                 |
+EL0  guest userland
+```
+
+Bismuth only gets involved on the EL2 traps it configures in `HCR_EL2`: hypercalls (`HVC`),
+stage-2 translation faults (guest physical not mapped / MMIO), the virtual timer, and virtual
+interrupt injection. Guest EL0<->EL1 syscalls run natively and never trap to EL2.
+
+## Staged roadmap
+
+- **S1 — EL2 boot + guest trap round-trip (DONE).** Reset stays at EL2; install `VBAR_EL2`; load a
+  guest blob; `eret` to EL1; service `HVC #0` hypercalls (print/exit). MMU off, no stage-2 — the
+  guest shares the host's flat physical space and is trusted hand-assembled code. Proves the
+  EL1-guest -> EL2-hypervisor mechanism. *(see `src/arch/aarch64/hyp.rs`, board `hypervisor`
+  feature, `run-hv.sh`.)*
+- **S2 — EL2 MMU + stage-2 translation.** Turn on `SCTLR_EL2.M` (EL2's own identity map, so EL2
+  gets Normal cacheable RAM + atomics), and set up **stage-2** tables (`VTTBR_EL2`, `VTCR_EL2`) so
+  the guest sees a *guest-physical* space that Bismuth maps to a bounded host-physical RAM window
+  the guest cannot escape. This is the real memory isolation: a VM, not shared RAM.
+- **S3 — vGIC + virtual timer.** Present the guest a GICv2/v3 it can program; inject virtual IRQs
+  (`ICH_*`/list registers); trap+offset `CNTV`/route `CNTVCT` so the guest timer works. Needed
+  before any interrupt-driven guest (i.e. any real OS).
+- **S4 — virtio-mmio backends.** Bismuth presents the guest virtio-mmio devices (console, block,
+  net) whose rings live in guest-physical RAM; trap the guest's doorbell writes (stage-2 MMIO
+  faults) and service the queues against Bismuth's real drivers/VFS/NIC. This is how the guest
+  does I/O without real device passthrough.
+- **S5 — boot a minimal guest OS.** With S2–S4, load a guest `Image`+DTB at the guest-physical
+  kernel address and boot it. Demonstrable here with a *hand-assembled* mini-guest that uses the
+  vGIC/timer/virtio (same no-toolchain tactic as the Linux-ABI ELFs).
+
+## The honest blocker for *literal* Linux/Docker
+
+Booting a real Linux kernel as the guest needs a Linux `Image` (and a DTB), i.e. a cross-compiled
+aarch64 Linux build. **This sandbox has no aarch64 Linux toolchain and no network to fetch a
+prebuilt image**, so the *mechanism* (S1–S5) is buildable and verifiable here, but the final
+"unmodified Ubuntu" step requires an external artifact that must be supplied. The same ceiling the
+Linux-ABI path hit: Bismuth's side is implementable and testable with hand-assembled guests;
+producing/fetching a real distro image is an environment limit, not a kernel limit.
+
+## Stage-1 implementation notes
+
+- Reset: `src/arch/aarch64/boot.rs` has a `#[cfg(feature = "hypervisor")] _start` that parks
+  secondaries, sets `SP_EL2`, zeroes `.bss`, and calls `rust_boot_hyp` -> the board `kernel_main`,
+  all **without** the EL2->EL1 drop the normal `_start` does.
+- Shim: `src/arch/aarch64/hyp.rs` (TCB). `hyp_vectors` (a 2 KiB-aligned `VBAR_EL2` table) routes
+  the Lower-EL-AArch64 synchronous slot to `hvc_vector`, which saves the guest GPRs, calls
+  `hvc_entry`, and `eret`s back. `run_guest(blob)` prints the EL (proving EL2), copies the guest
+  into RAM, sets `HCR_EL2.RW`/`SP_EL1`/`ELR_EL2`/`SPSR_EL2`, and `eret`s to EL1. Hypercall ABI:
+  `x0` = command (1 = print `[x1..x1+x2)`, 2 = exit `x1`).
+- Guest: `boards/qemu-virt-aarch64/src/hv_guest.rs` — a 108-byte decode-verified blob that prints
+  via `HVC_PRINT` then `HVC_EXIT`.
+- Run: `bash boards/qemu-virt-aarch64/run-hv.sh` (QEMU `-M virt,virtualization=on`).
