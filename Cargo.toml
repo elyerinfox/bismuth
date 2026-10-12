@@ -56,6 +56,8 @@ shell = []
 # total RAM stays static and allocation fails closed). OFF by default and outside the TCB; only
 # subsystems that genuinely need `alloc` (e.g. a Wasm container) pull it in.
 heap = ["dep:linked_list_allocator"]
+# A minimal WebAssembly interpreter (the C8 Wasm container). Needs a heap (alloc).
+wasm = ["heap"]
 # Trusted platform: TPM/secure-element root of trust, measured boot, sealing, attestation.
 tpm = ["crypto"]
 

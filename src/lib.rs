@@ -87,6 +87,8 @@ pub mod compat;
 #[cfg(feature = "shell")]
 pub mod shell;
 pub mod user;
+#[cfg(feature = "wasm")]
+pub mod wasm;
 
 // ----- support -----
 pub mod config;
