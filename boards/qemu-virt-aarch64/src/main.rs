@@ -19,7 +19,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(feature = "hypervisor")]
-mod hv_guest;
+mod hv_kernel;
 
 use bismuth::arch::mmio::Mmio;
 use bismuth::driver::sensor::SimSensor;
@@ -367,12 +367,13 @@ fn container_host() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main() -> ! {
-    // The `hypervisor` build stays at EL2 and runs the hypervisor shim (a hand-assembled guest at
-    // EL1 + its HVC hypercalls) instead of the normal EL1 kernel. Everything below is the EL1
-    // path, compiled out in that build.
+    // The `hypervisor` build stays at EL2 and runs the hypervisor shim instead of the normal EL1
+    // kernel: it loads a guest **arm64 Image** (`hv_kernel`) per the Linux boot protocol — parse
+    // the Image header, generate a DTB, enter at EL1 with x0=DTB — and services its traps.
+    // Everything below is the EL1 path, compiled out in that build.
     #[cfg(feature = "hypervisor")]
     {
-        bismuth::arch::aarch64::hyp::run_guest(&hv_guest::GUEST)
+        bismuth::arch::aarch64::hyp::run_guest(&hv_kernel::KERNEL)
     }
     #[cfg(not(feature = "hypervisor"))]
     {

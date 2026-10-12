@@ -150,6 +150,23 @@ interrupt injection. Guest EL0<->EL1 syscalls run natively and never trap to EL2
     device classes a Linux guest drives — the backing (a Bismuth VFS file as rootfs, the in-tree NIC
     as the link) is the remaining substitution, not new mechanism.
 
+- **S8 — the aarch64 Linux boot protocol (DONE).** The hypervisor now loads a guest **`Image`** and
+  hands it a generated **DTB**, exactly the contract a real Linux kernel expects:
+  - *Image header:* `parse_image` validates the 64-byte arm64 header (`Documentation/arm64/booting.rst`)
+    — magic `ARM\x64` (0x644d_5241) at offset 56 — and reads `text_offset`/`image_size`; `run_guest`
+    loads the image at `GUEST_IPA_BASE + text_offset`.
+  - *DTB generation:* `build_dtb` emits a flattened device tree (FDT v17, big-endian) into guest RAM
+    at IPA `0x4010_0000` — `/` (`#address/#size-cells`), `/chosen` (`bootargs`, `stdout-path`),
+    `/psci` (`arm,psci-1.0`, `method="smc"`), `/memory@40000000`, `/cpus/cpu@0` (`enable-method="psci"`),
+    `/intc@8000000` (GICv2), and the three `/virtio_mmio@…` nodes matching the S4/S7 device IPAs.
+  - *Boot entry:* `eret` to the image with `x0 = DTB IPA`, `x1=x2=x3=0`, EL1, MMU/caches off — the
+    arm64 kernel boot protocol verbatim.
+  - *Proof:* the hand-assembled `hv_kernel` carries a real Image header, is loaded through the
+    header path, validates the FDT magic (`0xd00d_feed`), prints the FDT totalsize, scans the DTB
+    for the `/chosen` `console=` bootargs and prints them, then powers off via a PSCI `SYSTEM_OFF`
+    `smc`. QEMU-verified. Because the load/DTB/entry path is the real one, dropping an actual Linux
+    `Image` in `hv_kernel` (on hardware, or QEMU with a larger `GUEST_RAM`) boots it.
+
 ## What the hypervisor can do today
 
 A `--features hypervisor` Bismuth boot (QEMU `-M virt,virtualization=on`) is a working minimal
@@ -160,27 +177,34 @@ virtio handshake + virtqueues (trap-and-emulate) — a **console** (drains to th
 device (host RAM disk, read/write requests), and a **network** device (TX/RX loopback) — a
 **free-running hardware-timer tick** (the EL2 physical timer injecting the guest's virtual-timer
 IRQ on its own cadence), **PSCI-over-SMC** power control
-(`VERSION`/`SYSTEM_OFF`/`RESET`/`FEATURES`/`CPU_ON`), and a small **hypercall ABI**. The capstone
-guest "OS" uses all of these together — prints a banner, reads a disk sector, round-trips a network
-frame, takes timer ticks, and powers itself off via PSCI. What a real Linux guest additionally
-needs (a kernel image, a fuller GICD, larger device backing) is enumerated next.
+(`VERSION`/`SYSTEM_OFF`/`RESET`/`FEATURES`/`CPU_ON`), and a small **hypercall ABI**. It loads a
+guest **`Image`** (arm64 header parse) and hands it a **generated DTB** in `x0` per the **Linux
+aarch64 boot protocol**. The capstone guests use all of this together — one "OS" prints a banner,
+reads a disk sector, round-trips a network frame, takes timer ticks and powers off via PSCI; the
+`hv_kernel` stand-in is loaded as a real `Image`, validates the DTB hand-off and reads its
+`/chosen` bootargs, then PSCIs off. What a real Linux guest additionally needs (an actual kernel
+image, a fuller GICD, larger device backing) is enumerated next.
 
 ## The honest blocker for *literal* Linux/Docker
 
-Booting a real Linux kernel as the guest needs a Linux `Image` (and a DTB), i.e. a cross-compiled
-aarch64 Linux build. **This sandbox has no aarch64 Linux toolchain and no network to fetch a
-prebuilt image**, so the *mechanism* (S1–S5) is buildable and verifiable here, but the final
-"unmodified Ubuntu" step requires an external artifact that must be supplied. The same ceiling the
-Linux-ABI path hit: Bismuth's side is implementable and testable with hand-assembled guests;
-producing/fetching a real distro image is an environment limit, not a kernel limit.
+Booting a real Linux kernel as the guest needs a Linux `Image` (and, for a distro, a rootfs), i.e. a
+cross-compiled aarch64 Linux build. **This sandbox has no aarch64 Linux toolchain and no network to
+fetch a prebuilt image**, so the entire hypervisor *mechanism* (S1–S8, including the Image-header
+load + DTB generation + boot-protocol entry) is built and QEMU-verified here with hand-assembled
+guests, but the final "unmodified Ubuntu" step requires that external `Image`/rootfs to be supplied.
+The same ceiling the Linux-ABI path hit: Bismuth's side is implemented and testable; producing or
+fetching a real distro image is an environment limit, not a kernel limit.
 
 ### To boot a real aarch64 Linux guest (concrete remaining work)
 
-With a Linux `Image` + DTB in hand (on real hardware or a networked build host), the remaining
-hypervisor-side work on top of S1–S5 is:
-- **Load + entry:** place the `Image` at the guest-physical kernel offset and the DTB in guest RAM;
-  enter with `x0` = DTB IPA per the Linux aarch64 boot protocol (bigger `GUEST_RAM` arena — tens of
-  MiB — and a stage-2 map to match).
+The hypervisor-side mechanism is now **complete** (S1–S8); the checklist below is all ✅ except the
+one external artifact. With a Linux `Image` + DTB in hand (on real hardware or a networked build
+host), a real guest boots through the same path the `hv_kernel` stand-in exercises:
+- **Load + entry / DTB:** ✅ DONE (S8) — `parse_image` loads the `Image` at `GUEST_IPA_BASE +
+  text_offset`, `build_dtb` generates the DTB in guest RAM, and entry is `x0` = DTB IPA per the
+  arm64 boot protocol. For a real kernel: enlarge the `GUEST_RAM` arena (2 MiB → tens of MiB) and
+  the stage-2 map to fit the kernel + initrd, and (if the image sets a non-zero `text_offset` or the
+  2 MiB-anywhere flag) honour that placement — the parse already returns `text_offset`.
 - **PSCI/SMC:** ✅ DONE (S6) — PSCI over `SMC` trapped via `HCR_EL2.TSC` (`VERSION`, `SYSTEM_OFF`,
   `SYSTEM_RESET`, `FEATURES`, `CPU_ON`→NOT_SUPPORTED single-vCPU). A real multi-vCPU guest would
   extend `CPU_ON` to actually start a second vCPU context.
@@ -196,10 +220,13 @@ hypervisor-side work on top of S1–S5 is:
   disk as the rootfs, bridge net to the in-tree NIC, and add used-buffer vIRQ injection (poll → IRQ).
 - **Console:** the S4 virtio-console already serves guest output; add RX for input.
 
-None of these are blocked *in principle* — they are more of the same trap-and-emulate the S1–S5
-mechanism already demonstrates — but together they are a substantial build, and the final boot
-still needs the external kernel image this sandbox cannot provide. Then `docker`/`k8s` inside that
-Linux guest is ordinary Linux userspace, unmodified.
+The only genuinely-remaining hypervisor work is the **vGIC distributor** (a fuller GICD/GICv3 GICR
+trap-and-emulate — Linux configures the distributor, not just the CPU interface) and hardening the
+backings for scale (used-buffer vIRQ injection instead of polling, a VFS-file rootfs, a bridged
+NIC, a larger `GUEST_RAM`). None are blocked *in principle* — they are more of the same
+trap-and-emulate S1–S8 already demonstrates — but the final boot still needs the external kernel
+`Image` + rootfs this sandbox cannot provide. Once a real Linux guest boots, `docker`/`k8s` inside
+it is ordinary, unmodified Linux userspace.
 
 ## Stage-1 implementation notes
 

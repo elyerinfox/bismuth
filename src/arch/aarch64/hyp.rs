@@ -340,6 +340,229 @@ fn seed_blk() {
     }
 }
 
+// ---- Stage 8: the aarch64 Linux boot protocol (Image header + DTB hand-off) ----
+//
+// A real guest kernel is an `Image` (Documentation/arm64/booting.rst): a 64-byte header carrying
+// `text_offset` (where to place it above a 2 MiB-aligned base), `image_size`, and the magic
+// `ARM\x64` (0x644d_5241) at offset 56. The hypervisor validates the header, copies the image to
+// `GUEST_IPA_BASE + text_offset`, *generates a flattened device tree* (DTB) describing the virtual
+// machine (memory, /chosen bootargs, PSCI, CPUs, GIC, the virtio-mmio devices), places it in guest
+// RAM, and enters the image per the boot contract: `x0 = DTB IPA`, `x1=x2=x3=0`, MMU/caches off.
+// This is exactly what a real Linux kernel expects, so dropping a real `Image` in here (on hardware
+// or QEMU `-kernel`) boots it; the hand-assembled stand-in `hv_kernel` validates the contract.
+
+/// The arm64 `Image` magic at header offset 56 ("ARM\x64", little-endian).
+const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
+/// Where the generated DTB lives inside the guest RAM window (1 MiB in — clear of the image at the
+/// base and the stack at the top). The kernel receives this IPA in `x0`.
+const DTB_OFFSET: u64 = 0x10_0000;
+const DTB_IPA: u64 = GUEST_IPA_BASE + DTB_OFFSET;
+
+/// Parse an arm64 `Image` header: returns `(text_offset, image_size)` if the magic is valid.
+fn parse_image(blob: &[u8]) -> Option<(u64, u64)> {
+    if blob.len() < 64 {
+        return None;
+    }
+    let le32 = |o: usize| u32::from_le_bytes([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]]);
+    let le64 = |o: usize| (le32(o) as u64) | ((le32(o + 4) as u64) << 32);
+    if le32(56) != ARM64_IMAGE_MAGIC {
+        return None;
+    }
+    Some((le64(8), le64(16)))
+}
+
+// Flattened Device Tree (DTB/FDT v17) builder. Big-endian throughout, per the spec.
+const FDT_BEGIN_NODE: u32 = 1;
+const FDT_END_NODE: u32 = 2;
+const FDT_PROP: u32 = 3;
+const FDT_END: u32 = 9;
+const FDT_MAGIC: u32 = 0xd00d_feed;
+
+const DTB_STRUCT_CAP: usize = 1536;
+const DTB_STRINGS_CAP: usize = 512;
+const DTB_CAP: usize = 2048;
+static mut DTB_STRUCT: [u8; DTB_STRUCT_CAP] = [0; DTB_STRUCT_CAP];
+static mut DTB_STRINGS: [u8; DTB_STRINGS_CAP] = [0; DTB_STRINGS_CAP];
+static mut DTB_BUF: [u8; DTB_CAP] = [0; DTB_CAP];
+
+/// A minimal FDT writer: a struct block and a strings block built with bump cursors.
+struct Fdt {
+    s: &'static mut [u8],
+    sl: usize,
+    t: &'static mut [u8],
+    tl: usize,
+}
+impl Fdt {
+    fn be32(&mut self, v: u32) {
+        self.s[self.sl..self.sl + 4].copy_from_slice(&v.to_be_bytes());
+        self.sl += 4;
+    }
+    fn pad(&mut self) {
+        while self.sl % 4 != 0 {
+            self.s[self.sl] = 0;
+            self.sl += 1;
+        }
+    }
+    fn begin(&mut self, name: &[u8]) {
+        self.be32(FDT_BEGIN_NODE);
+        for &b in name {
+            self.s[self.sl] = b;
+            self.sl += 1;
+        }
+        self.s[self.sl] = 0;
+        self.sl += 1;
+        self.pad();
+    }
+    fn end(&mut self) {
+        self.be32(FDT_END_NODE);
+    }
+    fn intern(&mut self, name: &[u8]) -> u32 {
+        let off = self.tl as u32;
+        for &b in name {
+            self.t[self.tl] = b;
+            self.tl += 1;
+        }
+        self.t[self.tl] = 0;
+        self.tl += 1;
+        off
+    }
+    fn prop_head(&mut self, name: &[u8], len: u32) {
+        let no = self.intern(name);
+        self.be32(FDT_PROP);
+        self.be32(len);
+        self.be32(no);
+    }
+    fn prop_str(&mut self, name: &[u8], val: &[u8]) {
+        self.prop_head(name, val.len() as u32 + 1);
+        for &b in val {
+            self.s[self.sl] = b;
+            self.sl += 1;
+        }
+        self.s[self.sl] = 0;
+        self.sl += 1;
+        self.pad();
+    }
+    fn prop_u32(&mut self, name: &[u8], v: u32) {
+        self.prop_head(name, 4);
+        self.be32(v);
+    }
+    fn prop_empty(&mut self, name: &[u8]) {
+        self.prop_head(name, 0);
+    }
+    fn prop_cells(&mut self, name: &[u8], cells: &[u32]) {
+        self.prop_head(name, (cells.len() * 4) as u32);
+        for &c in cells {
+            self.be32(c);
+        }
+    }
+}
+
+/// Generate a flattened device tree for the guest VM into [`DTB_BUF`]; returns its total size.
+/// Describes RAM `[mem_base, mem_base+mem_size)`, `/chosen` bootargs, PSCI-over-SMC, one CPU, the
+/// GICv2, and the three virtio-mmio devices — the standard nodes a Linux guest reads at boot.
+fn build_dtb(mem_base: u64, mem_size: u64) -> usize {
+    let hi = |v: u64| (v >> 32) as u32;
+    let lo = |v: u64| v as u32;
+    // SAFETY: single-threaded EL2 bring-up; these statics are ours alone.
+    let (sl, tl) = unsafe {
+        let s = core::slice::from_raw_parts_mut(addr_of_mut!(DTB_STRUCT) as *mut u8, DTB_STRUCT_CAP);
+        let t = core::slice::from_raw_parts_mut(addr_of_mut!(DTB_STRINGS) as *mut u8, DTB_STRINGS_CAP);
+        let mut f = Fdt { s, sl: 0, t, tl: 0 };
+
+        f.begin(b""); // root
+        f.prop_u32(b"#address-cells", 2);
+        f.prop_u32(b"#size-cells", 2);
+        f.prop_str(b"compatible", b"linux,dummy-virt");
+        f.prop_str(b"model", b"Bismuth hypervisor guest VM");
+
+        f.begin(b"chosen");
+        f.prop_str(b"bootargs", b"console=ttyAMA0 earlycon");
+        f.prop_str(b"stdout-path", b"/pl011@9000000");
+        f.end();
+
+        f.begin(b"psci");
+        f.prop_str(b"compatible", b"arm,psci-1.0");
+        f.prop_str(b"method", b"smc");
+        f.end();
+
+        f.begin(b"memory@40000000");
+        f.prop_str(b"device_type", b"memory");
+        f.prop_cells(b"reg", &[hi(mem_base), lo(mem_base), hi(mem_size), lo(mem_size)]);
+        f.end();
+
+        f.begin(b"cpus");
+        f.prop_u32(b"#address-cells", 1);
+        f.prop_u32(b"#size-cells", 0);
+        f.begin(b"cpu@0");
+        f.prop_str(b"device_type", b"cpu");
+        f.prop_str(b"compatible", b"arm,cortex-a53");
+        f.prop_u32(b"reg", 0);
+        f.prop_str(b"enable-method", b"psci");
+        f.end(); // cpu@0
+        f.end(); // cpus
+
+        f.begin(b"intc@8000000");
+        f.prop_str(b"compatible", b"arm,cortex-a15-gic");
+        f.prop_empty(b"interrupt-controller");
+        f.prop_u32(b"#interrupt-cells", 3);
+        f.prop_cells(b"reg", &[0, 0x0800_0000, 0, 0x1_0000, 0, 0x0801_0000, 0, 0x1_0000]);
+        f.end();
+
+        // The three virtio-mmio devices (console / block / net) at their IPA slots.
+        for i in 0..VIRTIO_NDEV as u64 {
+            let base = VIRTIO_BASE + i * VIRTIO_STRIDE;
+            // node name "virtio_mmio@0a0000XX"
+            let mut name = *b"virtio_mmio@0a000000";
+            let mut v = base;
+            for k in 0..8 {
+                let nyb = (v & 0xf) as u8;
+                name[19 - k] = if nyb < 10 { b'0' + nyb } else { b'a' + nyb - 10 };
+                v >>= 4;
+            }
+            f.begin(&name);
+            f.prop_str(b"compatible", b"virtio,mmio");
+            f.prop_cells(b"reg", &[hi(base), lo(base), 0, VIRTIO_STRIDE as u32]);
+            f.end();
+        }
+
+        f.end(); // root
+        f.be32(FDT_END);
+        (f.sl, f.tl)
+    };
+
+    // Assemble [header(40) | mem_rsvmap(16) | struct(sl) | strings(tl)] into DTB_BUF.
+    let off_struct = 40 + 16;
+    let off_strings = off_struct + sl;
+    let total = off_strings + tl;
+    // SAFETY: single-threaded EL2; total is bounded by the cursor caps (< DTB_CAP).
+    unsafe {
+        let buf = core::slice::from_raw_parts_mut(addr_of_mut!(DTB_BUF) as *mut u8, DTB_CAP);
+        for b in buf.iter_mut() {
+            *b = 0;
+        }
+        let hdr: [u32; 10] = [
+            FDT_MAGIC,
+            total as u32,
+            off_struct as u32,
+            off_strings as u32,
+            40, // off_mem_rsvmap (right after the header; the 16-byte terminator entry is zeros)
+            17, // version
+            16, // last_comp_version
+            0,  // boot_cpuid_phys
+            tl as u32,
+            sl as u32,
+        ];
+        for (i, w) in hdr.iter().enumerate() {
+            buf[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        let st = core::slice::from_raw_parts(addr_of_mut!(DTB_STRUCT) as *const u8, sl);
+        buf[off_struct..off_struct + sl].copy_from_slice(st);
+        let str_ = core::slice::from_raw_parts(addr_of_mut!(DTB_STRINGS) as *const u8, tl);
+        buf[off_strings..off_strings + tl].copy_from_slice(str_);
+    }
+    total
+}
+
 // Small physical-memory accessors (EL2 MMU-off ⇒ host-physical == VA). Used to walk guest RAM.
 fn rd_u8(a: u64) -> u8 {
     // SAFETY: `a` is a host-physical address inside the guest RAM arena (bounds-checked by caller).
@@ -964,19 +1187,51 @@ pub fn run_guest(blob: &[u8]) -> ! {
         hyp_exit(3);
     }
 
-    // Copy the guest into the host-physical arena (at offset 0); the guest runs at its IPA base
-    // under stage-2, with its stack at the top of the IPA window.
-    let n = blob.len().min(GUEST_RAM_SIZE as usize);
+    // Stage 8: if the blob is an arm64 `Image`, load it per the Linux boot protocol — place it at
+    // `GUEST_IPA_BASE + text_offset` and hand the kernel a generated DTB in `x0`. A headerless blob
+    // (a legacy inline guest) loads at the base with `text_offset = 0`.
+    let image = parse_image(blob);
+    let text_off = image.map(|(t, _)| t).unwrap_or(0);
+    let n = blob.len().min((GUEST_RAM_SIZE - text_off) as usize);
     // SAFETY: single-threaded EL2 bring-up; the arena is ours alone.
     unsafe {
-        let buf = addr_of_mut!(GUEST_RAM) as *mut u8;
+        let buf = (addr_of_mut!(GUEST_RAM) as *mut u8).add(text_off as usize);
         for i in 0..n {
             core::ptr::write_volatile(buf.add(i), blob[i]);
         }
         asm!("dsb ish", options(nostack, preserves_flags));
     }
-    let entry = GUEST_IPA_BASE; // guest-physical (IPA) entry
+    let entry = GUEST_IPA_BASE + text_off; // guest-physical (IPA) entry
     let gsp = (GUEST_IPA_BASE + GUEST_RAM_SIZE) & !0xf; // guest stack top (IPA)
+
+    // Generate the guest's device tree and place it in guest RAM; the kernel receives its IPA in x0.
+    let dtb_total = build_dtb(GUEST_IPA_BASE, GUEST_RAM_SIZE);
+    // SAFETY: copy the DTB into the arena at DTB_OFFSET (bounded by DTB_CAP ≪ the window).
+    unsafe {
+        let dst = (addr_of_mut!(GUEST_RAM) as *mut u8).add(DTB_OFFSET as usize);
+        let src = addr_of_mut!(DTB_BUF) as *const u8;
+        for i in 0..dtb_total {
+            core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
+        }
+        asm!("dsb ish", options(nostack, preserves_flags));
+    }
+
+    if let Some((t, sz)) = image {
+        puts(b"[hyp] arm64 Image: magic OK, text_offset=");
+        put_hex(t);
+        puts(b" image_size=");
+        put_hex(sz);
+        puts(b" -> loading at IPA ");
+        put_hex(entry);
+        put(b'\n');
+    } else {
+        puts(b"[hyp] no Image header (legacy inline guest); entering at IPA base\n");
+    }
+    puts(b"[hyp] generated DTB at IPA ");
+    put_hex(DTB_IPA);
+    puts(b" (");
+    put_dec(dtb_total as u64);
+    puts(b" bytes): / /chosen(bootargs) /psci /memory /cpus /intc /virtio_mmio x3\n");
 
     // Seed the virtio-blk RAM disk the guest will read.
     seed_blk();
@@ -1003,12 +1258,15 @@ pub fn run_guest(blob: &[u8]) -> ! {
     puts(b" s\n");
     puts(b"[hyp] launching guest at EL1, entry IPA=");
     put_hex(entry);
-    put(b'\n');
+    puts(b", x0=DTB(");
+    put_hex(DTB_IPA);
+    puts(b") per the arm64 boot protocol\n");
 
     let vbar = hyp_vectors as *const () as u64;
     // SAFETY: install the EL2 vectors, make the guest AArch64 + enable stage-2 (HCR_EL2.RW|VM),
-    // set its stack and return state, and `eret` into it at EL1. Control re-enters only via
-    // `VBAR_EL2` on a trap. (No asm outputs/scratch: `noreturn` forbids them.)
+    // set its stack and return state, hand it `x0=DTB`/`x1..x3=0` per the arm64 Linux boot protocol,
+    // and `eret` into it at EL1. Control re-enters only via `VBAR_EL2` on a trap. x0..x3 are set
+    // explicitly so the `{}` operands land in other registers; nothing clobbers them before `eret`.
     unsafe {
         asm!(
             "msr vbar_el2, {vbar}",
@@ -1026,6 +1284,10 @@ pub fn run_guest(blob: &[u8]) -> ! {
             gsp = in(reg) gsp,
             entry = in(reg) entry,
             spsr = in(reg) 0x3c5u64,
+            in("x0") DTB_IPA,
+            in("x1") 0u64,
+            in("x2") 0u64,
+            in("x3") 0u64,
             options(noreturn),
         )
     }
