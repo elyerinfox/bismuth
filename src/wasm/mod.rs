@@ -47,6 +47,10 @@ pub struct Module {
     imports: Vec<(Host, u32)>,
     /// Minimum linear-memory size, in 64 KiB pages (0 = no memory).
     mem_pages: u32,
+    /// Initial values of the module's globals (wasm-ld emits a mutable one for the shadow stack).
+    globals: Vec<i64>,
+    /// Active data segments `(offset, bytes)` copied into linear memory at instantiation.
+    data: Vec<(u32, Vec<u8>)>,
 }
 
 struct Func {
@@ -55,9 +59,10 @@ struct Func {
     body: Vec<u8>,
 }
 
-/// Mutable per-invocation state: the linear memory and a pending `proc_exit` code.
+/// Mutable per-invocation state: the linear memory, the globals, and a pending `proc_exit` code.
 struct Ctx {
     mem: Vec<u8>,
+    globals: Vec<i64>,
     steps: u64,
     exit: Option<i32>,
 }
@@ -100,6 +105,23 @@ impl<'a> Reader<'a> {
     }
     fn u32(&mut self) -> Result<u32, Error> {
         Ok(self.uleb()? as u32)
+    }
+
+    /// Read a constant init expression (`i32.const`/`i64.const` … `end`), returning its value.
+    fn const_expr(&mut self) -> Result<i64, Error> {
+        let op = self.byte()?;
+        let v = match op {
+            0x41 | 0x42 => {
+                let (val, n) = sleb(self.b, self.p)?;
+                self.p += n;
+                val
+            }
+            _ => return Err(Error::Unsupported),
+        };
+        if self.byte()? != 0x0b {
+            return Err(Error::Invalid);
+        }
+        Ok(v)
     }
 }
 
@@ -154,6 +176,8 @@ impl Module {
         let mut exports = Vec::new();
         let mut imports: Vec<(Host, u32)> = Vec::new();
         let mut mem_pages = 0u32;
+        let mut globals: Vec<i64> = Vec::new();
+        let mut data: Vec<(u32, Vec<u8>)> = Vec::new();
         while r.p < bin.len() {
             let id = r.byte()?;
             let len = r.u32()? as usize;
@@ -266,11 +290,42 @@ impl Module {
                         }
                     }
                 }
+                6 => {
+                    // Global section: valtype + mutability + a constant init expression.
+                    let n = r.u32()?;
+                    for _ in 0..n {
+                        let _valtype = r.byte()?;
+                        let _mutable = r.byte()?;
+                        globals.push(r.const_expr()?);
+                    }
+                }
                 10 => {
                     let n = r.u32()?;
                     for _ in 0..n {
                         let sz = r.u32()? as usize;
                         codes.push(Vec::from(r.bytes(sz)?));
+                    }
+                }
+                11 => {
+                    // Data section: active segments (mode 0 / 2) are copied into memory at offset.
+                    let n = r.u32()?;
+                    for _ in 0..n {
+                        let mode = r.u32()?;
+                        let off = match mode {
+                            0 => r.const_expr()? as u32,
+                            2 => {
+                                let _memidx = r.u32()?;
+                                r.const_expr()? as u32
+                            }
+                            _ => {
+                                // Passive segment: size-prefixed bytes, no offset — skip.
+                                let sz = r.u32()? as usize;
+                                let _ = r.bytes(sz)?;
+                                continue;
+                            }
+                        };
+                        let sz = r.u32()? as usize;
+                        data.push((off, Vec::from(r.bytes(sz)?)));
                     }
                 }
                 _ => {}
@@ -297,14 +352,26 @@ impl Module {
             let body = Vec::from(&code[lr.p..]);
             funcs.push(Func { type_idx: ti, n_locals, body });
         }
-        Ok(Module { types, funcs, exports, imports, mem_pages })
+        Ok(Module { types, funcs, exports, imports, mem_pages, globals, data })
+    }
+
+    /// Build a fresh instance's linear memory with the data segments applied.
+    fn new_memory(&self) -> Vec<u8> {
+        let mut mem = alloc::vec::from_elem(0u8, self.mem_pages as usize * PAGE);
+        for (off, bytes) in &self.data {
+            let at = *off as usize;
+            if at + bytes.len() <= mem.len() {
+                mem[at..at + bytes.len()].copy_from_slice(bytes);
+            }
+        }
+        mem
     }
 
     /// Invoke an exported function by name with `i32` arguments; returns its single `i32` result
     /// (or `None` if it returns nothing).
     pub fn invoke(&self, name: &str, args: &[i32]) -> Result<Option<i32>, Error> {
         let idx = self.exports.iter().find(|(n, _)| n == name).map(|(_, i)| *i).ok_or(Error::NotFound)?;
-        let mut ctx = Ctx { mem: alloc::vec::from_elem(0u8, self.mem_pages as usize * PAGE), steps: 0, exit: None };
+        let mut ctx = Ctx { mem: self.new_memory(), globals: self.globals.clone(), steps: 0, exit: None };
         let a64: Vec<i64> = args.iter().map(|&x| x as i64).collect();
         let r = self.call(idx, &a64, 0, &mut ctx)?;
         // A `proc_exit` unwinds to here; surface its code as the result (truncating i64 to i32).
@@ -314,7 +381,7 @@ impl Module {
     /// Invoke the module's conventional WASI entry point (`_start`), returning the exit code.
     pub fn run_wasi(&self) -> Result<i32, Error> {
         let idx = self.exports.iter().find(|(n, _)| n == "_start").map(|(_, i)| *i).ok_or(Error::NotFound)?;
-        let mut ctx = Ctx { mem: alloc::vec::from_elem(0u8, self.mem_pages as usize * PAGE), steps: 0, exit: None };
+        let mut ctx = Ctx { mem: self.new_memory(), globals: self.globals.clone(), steps: 0, exit: None };
         self.call(idx, &[], 0, &mut ctx)?;
         Ok(ctx.exit.unwrap_or(0))
     }
@@ -541,6 +608,17 @@ impl Module {
                     pc += n;
                     let v = *stack.last().ok_or(Error::Invalid)?;
                     *locals.get_mut(i as usize).ok_or(Error::Invalid)? = v;
+                }
+                0x23 => {
+                    let (i, n) = uleb_at(body, pc)?;
+                    pc += n;
+                    stack.push(*ctx.globals.get(i as usize).ok_or(Error::Invalid)?); // global.get
+                }
+                0x24 => {
+                    let (i, n) = uleb_at(body, pc)?;
+                    pc += n;
+                    let v = stack.pop().ok_or(Error::Invalid)?;
+                    *ctx.globals.get_mut(i as usize).ok_or(Error::Invalid)? = v; // global.set
                 }
                 0x41 => {
                     let (v, n) = sleb(body, pc)?;
@@ -790,7 +868,7 @@ fn skip(body: &[u8], pc: usize) -> Result<usize, Error> {
     let mut p = pc + 1;
     match op {
         0x02 | 0x03 | 0x04 => p += 1,                       // blocktype
-        0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 => p += uleb_at(body, p)?.1, // one uleb
+        0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 => p += uleb_at(body, p)?.1, // one uleb
         0x41 | 0x42 => p += sleb(body, p)?.1,               // i32.const / i64.const
         0x28..=0x3e => {
             // load/store memarg: align uleb + offset uleb
