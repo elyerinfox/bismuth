@@ -30,6 +30,8 @@ mod linux_cat;
 mod linux_elf;
 #[cfg(feature = "linux-demo")]
 mod linux_mmap;
+#[cfg(feature = "linux-demo")]
+mod linux_write;
 
 #[cfg(feature = "linux-demo")]
 static LINUXFS: bismuth::fs::RamFs<16, 64, 64> = bismuth::fs::RamFs::new();
@@ -406,6 +408,8 @@ static LXS1: Stack<8192> = Stack::new();
 static LXS2: Stack<8192> = Stack::new();
 #[cfg(feature = "linux-demo")]
 static LXS3: Stack<8192> = Stack::new();
+#[cfg(feature = "linux-demo")]
+static LXS4: Stack<8192> = Stack::new();
 
 /// A container's root task: load its Linux binary and enter it at EL0 in this container's domain.
 /// The launcher returns once the EL0 task is spawned; the container lives until that task exits.
@@ -426,6 +430,10 @@ fn lx_cat(_: usize) {
 #[cfg(feature = "linux-demo")]
 fn lx_mmap(_: usize) {
     lx_launch(&linux_mmap::MMAP_ELF, "mmap");
+}
+#[cfg(feature = "linux-demo")]
+fn lx_write(_: usize) {
+    lx_launch(&linux_write::WRITE_ELF, "write");
 }
 
 /// Three Linux binaries, each packaged as a container: an isolated domain (two task slots: the
@@ -468,6 +476,20 @@ static LINUX_MANIFEST: bismuth::security::container::ContainerManifest = {
                 on_fault: OnFault::Stop,
                 image_hash: [0; 32],
             },
+            // A container with read-write storage: it creates and writes a file into its root.
+            ContainerDecl {
+                domain: DomainDecl {
+                    spec: DomainSpec::isolated("lxwrite", 4, 2),
+                    grants: &[],
+                    dirs: &[DirGrantDecl { path: "/", name: "root", rights: Rights::READ.union(Rights::WRITE) }],
+                },
+                entry: ContainerEntry::privileged(lx_write, 3, &LXS4),
+                version: 1,
+                cpu: None,
+                ram_bytes: 131072,
+                on_fault: OnFault::Stop,
+                image_hash: [0; 32],
+            },
         ],
         supervisor: None,
     }
@@ -492,7 +514,7 @@ fn linux_demo() {
     fs::close(f);
 
     container::install(&LINUX_MANIFEST).unwrap(); // creates domains, applies dir grants, seals
-    for name in ["lxhello", "lxcat", "lxmmap"] {
+    for name in ["lxhello", "lxcat", "lxmmap", "lxwrite"] {
         let c = container::find(name).unwrap();
         kprintln!("[linux] starting container '{name}'");
         container::start(c).unwrap();
@@ -503,21 +525,33 @@ fn linux_demo() {
 /// Wait for the three Linux containers to run their binaries to `exit`, then report and quit.
 #[cfg(all(not(feature = "net-demo"), feature = "linux-demo"))]
 fn linux_monitor(_: usize) {
+    use bismuth::fs::{self, OpenMode};
     use bismuth::security::{self, container};
     // The binaries are tiny; give them time to run and exit (each exit tears its domain down).
-    for _ in 0..50 {
+    for _ in 0..80 {
         task::sleep_ticks(10);
         let mut done = 0;
+        let mut total = 0;
         container::for_each(|c, _| {
+            total += 1;
             if security::is_killed(c.0) {
                 done += 1;
             }
         });
-        if done == 3 {
+        if done == total {
             break;
         }
     }
-    kprintln!("aarch64 Linux-container demo complete: three Linux binaries ran as containers — write loop, VFS file reader, heap allocator. PASS");
+    // The 'lxwrite' container created a file in the shared VFS; read it back to prove its write
+    // persisted (container storage).
+    if let Ok(f) = fs::open("/output.txt", OpenMode::READ) {
+        let mut buf = [0u8; 128];
+        if let Ok(n) = fs::read(f, &mut buf) {
+            kprintln!("[verify] /output.txt (written by lxwrite): {}", core::str::from_utf8(&buf[..n]).unwrap_or("?").trim_end());
+        }
+        fs::close(f);
+    }
+    kprintln!("aarch64 Linux-container demo complete: four Linux binaries ran as containers — write loop, VFS reader (lseek), heap allocator (mmap), and a file writer. PASS");
     bismuth::arch::aarch64::qemu_exit(0);
 }
 

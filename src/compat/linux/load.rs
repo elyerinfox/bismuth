@@ -31,7 +31,7 @@ use crate::security::DirCap;
 const IMAGE_BYTES: usize = 128 * 1024;
 const PAGE: usize = 4096;
 /// How many Linux processes (one per domain) can be loaded at once.
-const MAX_PROCS: usize = 3;
+const MAX_PROCS: usize = 4;
 #[cfg(feature = "fs")]
 const MAX_FDS: usize = 8;
 #[cfg(feature = "fs")]
