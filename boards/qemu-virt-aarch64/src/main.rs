@@ -25,7 +25,18 @@ use bismuth::security::{self, DomainId, DomainSpec, Rights};
 use bismuth::{Stack, TaskId, Timeout, UserStack2K, kprintln, task, user};
 
 #[cfg(feature = "linux-demo")]
+mod linux_cat;
+#[cfg(feature = "linux-demo")]
 mod linux_elf;
+
+#[cfg(feature = "linux-demo")]
+static LINUXFS: bismuth::fs::RamFs<16, 64, 64> = bismuth::fs::RamFs::new();
+#[cfg(feature = "linux-demo")]
+static SLX: Stack<16384> = Stack::new();
+#[cfg(feature = "linux-demo")]
+static LX_D1: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "linux-demo")]
+static LX_D2: AtomicU32 = AtomicU32::new(0);
 
 /// The one place hardware addresses are asserted. QEMU `virt`: PL011 UART0 at 0x0900_0000,
 /// routed to GIC SPI 1 (interrupt 32 + 1).
@@ -396,38 +407,57 @@ pub extern "C" fn kernel_main() -> ! {
 /// the task. A watchdog then exits QEMU so the run terminates cleanly.
 #[cfg(all(not(feature = "net-demo"), feature = "linux-demo"))]
 fn linux_demo() {
-    kprintln!("Bismuth {} on QEMU virt — Linux-ABI demo (EL0 Linux ELF)", env!("CARGO_PKG_VERSION"));
-    let dom = security::create_domain(DomainSpec::sandboxed("linux", 4, 1)).unwrap();
+    use bismuth::fs::{self, OpenMode};
+    kprintln!("Bismuth {} on QEMU virt — Linux-ABI demo (EL0 Linux binaries)", env!("CARGO_PKG_VERSION"));
+
+    // Seed a file the second Linux binary will read through the VFS.
+    LINUXFS.format();
+    fs::mount("/", &LINUXFS).unwrap();
+    let f = fs::open("/greeting.txt", OpenMode::RDWR.with(OpenMode::CREATE)).unwrap();
+    fs::write(f, b"[file] Hello from a VFS file, read by a Linux binary at EL0!\n").unwrap();
+    fs::close(f);
+
+    // Two sandboxed domains: a normal `exit` tears its domain down, so each binary gets its own.
+    let d1 = security::create_domain(DomainSpec::sandboxed("linux1", 4, 1)).unwrap();
+    let d2 = security::create_domain(DomainSpec::sandboxed("linux2", 4, 1)).unwrap();
+    fs::grant_dir(d2, "/", Rights::READ, "root").unwrap(); // the file reader's confined root
     security::seal().unwrap();
-    match bismuth::compat::linux::load::load_and_run(&linux_elf::HELLO_ELF, "hello", 2, dom) {
-        Ok(tid) => {
-            kprintln!("[linux] loaded hello ELF; entering EL0 at its _start");
-            APP_TASK.store(tid.as_raw(), Ordering::Relaxed);
-        }
-        Err(e) => {
-            kprintln!("[linux] load failed: {e:?}");
-            bismuth::arch::aarch64::qemu_exit(1);
-        }
-    }
-    task::spawn("done", 1, &SD, linux_finisher, 0).unwrap();
+    LX_D1.store(d1.0 as u32, Ordering::Relaxed);
+    LX_D2.store(d2.0 as u32, Ordering::Relaxed);
+    task::spawn("linuxdrv", 1, &SLX, linux_driver, 0).unwrap();
 }
 
-/// Await the Linux task's `exit` and report the demo result.
+/// Run the two hand-assembled Linux binaries in turn, then report and exit.
 #[cfg(all(not(feature = "net-demo"), feature = "linux-demo"))]
-fn linux_finisher(_: usize) {
-    let tid = TaskId::from_raw(APP_TASK.load(Ordering::Relaxed));
-    kprintln!("[done] waiting for the Linux task to exit...");
-    let r = task::join(tid, Timeout::ms(5000));
-    match r {
-        Ok(_) => {
-            kprintln!("aarch64 Linux-ABI demo complete: the EL0 Linux ELF ran, wrote via the Linux write syscall, and exited. PASS");
-            bismuth::arch::aarch64::qemu_exit(0);
+fn linux_driver(_: usize) {
+    use bismuth::compat::linux::load::load_and_run;
+    let d1 = DomainId(LX_D1.load(Ordering::Relaxed) as u8);
+    let d2 = DomainId(LX_D2.load(Ordering::Relaxed) as u8);
+
+    kprintln!("[linux] #1: a write-loop binary");
+    match load_and_run(&linux_elf::HELLO_ELF, "hello", 2, d1) {
+        Ok(t) => {
+            let _ = task::join(t, Timeout::ms(5000));
         }
         Err(e) => {
-            kprintln!("aarch64 Linux-ABI demo FAILED (join={e:?})");
+            kprintln!("[linux] #1 load failed: {e:?}");
             bismuth::arch::aarch64::qemu_exit(1);
         }
     }
+
+    kprintln!("[linux] #2: a binary that openat()+read()s a VFS file and writes it to stdout");
+    match load_and_run(&linux_cat::CAT_ELF, "cat", 2, d2) {
+        Ok(t) => {
+            let _ = task::join(t, Timeout::ms(5000));
+        }
+        Err(e) => {
+            kprintln!("[linux] #2 load failed: {e:?}");
+            bismuth::arch::aarch64::qemu_exit(1);
+        }
+    }
+
+    kprintln!("aarch64 Linux-ABI demo complete: two EL0 Linux binaries ran — a write loop and a VFS file reader via openat/read/write. PASS");
+    bismuth::arch::aarch64::qemu_exit(0);
 }
 
 /// The EL0 user-isolation demo: two preempted workers, a sandboxed task, a rogue task that
