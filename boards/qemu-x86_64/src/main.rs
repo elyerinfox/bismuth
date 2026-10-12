@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use bismuth::driver::sensor::SimSensor;
 use bismuth::security::{self, DomainId, DomainSpec, Rights};
-use bismuth::{Stack, TaskId, Timeout, UserStack2K, kprintln, task, user};
+use bismuth::{Stack, TaskId, Timeout, UserStack4K, kprintln, task, user};
 use bootloader_api::config::Mapping;
 
 // Ask the bootloader to direct-map all physical memory, so the kernel can walk and edit the
@@ -31,8 +31,10 @@ bootloader_api::entry_point!(kernel_main, config = &CONFIG);
 static SA: Stack<4096> = Stack::new();
 static SB: Stack<4096> = Stack::new();
 static SD: Stack<4096> = Stack::new();
-static S_APP: UserStack2K = UserStack2K::new();
-static S_ROGUE: UserStack2K = UserStack2K::new();
+// Page-sized, page-aligned user stacks so each domain owns a distinct 4 KiB page — the cross-
+// domain isolation proof below reads one domain's page from another.
+static S_APP: UserStack4K = UserStack4K::new();
+static S_ROGUE: UserStack4K = UserStack4K::new();
 
 // A device the sandboxed task is granted (read-only).
 static SENSOR: SimSensor = SimSensor::new(1);
@@ -75,15 +77,17 @@ extern "C-unwind" fn sandboxed(_: usize) {
     user::exit(0)
 }
 
-/// A misbehaving unprivileged task: it tries to read kernel memory. In ring 3 that address is
-/// supervisor-only, so the read faults; the kernel kills this task's domain and carries on.
+/// A misbehaving unprivileged task in its OWN domain that tries to read **another domain's**
+/// user page (the sandboxed task's stack). With per-domain ring-3 isolation that page is demoted
+/// to supervisor-only while this domain runs, so the read faults and the kernel kills just this
+/// domain. (Kernel memory is equally unreachable — same `U/S` mechanism.)
 extern "C-unwind" fn rogue(_: usize) {
-    user::log(b"[ring3] rogue task attempts to read kernel memory...\n");
-    let kernel_ptr = &SENSOR as *const SimSensor as *const u8;
-    // SAFETY (demo): this is deliberately illegal from ring 3. The access must page-fault and
-    // never return here; if isolation were broken the line below would print.
-    let _ = unsafe { core::ptr::read_volatile(kernel_ptr) };
-    user::log(b"[ring3] ERROR: rogue read succeeded - isolation is broken!\n");
+    user::log(b"[ring3] rogue task attempts to read another domain's memory...\n");
+    let foreign = &S_APP as *const UserStack4K as *const u8;
+    // SAFETY (demo): deliberately illegal cross-domain read. It must page-fault and never
+    // return here; if isolation were broken the line below would print.
+    let _ = unsafe { core::ptr::read_volatile(foreign) };
+    user::log(b"[ring3] ERROR: cross-domain read succeeded - isolation is broken!\n");
     user::exit(0)
 }
 
@@ -101,7 +105,7 @@ fn finisher(_: usize) {
     kprintln!("rogue:   killed={} faults={}", security::is_killed(rogue_domain), security::faults(rogue_domain));
 
     if app_ok && rogue_killed {
-        kprintln!("x86-64 ring-3 demo complete: preemption, sandboxed syscalls, and fault-kills-domain all verified. PASS");
+        kprintln!("x86-64 ring-3 demo complete: preemption, sandboxed syscalls, and per-domain memory isolation (a cross-domain read faulted and killed only the rogue) all verified. PASS");
         bismuth::arch::x86_64::debug_exit(0);
     } else {
         kprintln!("x86-64 ring-3 demo FAILED (app_ok={app_ok} rogue_killed={rogue_killed})");

@@ -1,0 +1,42 @@
+INFO : Framebuffer info: FrameBufferInfo { byte_len: 2764800, width: 1280, height: 720, pixel_format: Bgr, bytes_per_pixel: 3, stride: 1280 }
+INFO : 4th Stage
+INFO : BiosInfo { stage_4: Region { start: 130000, len: 25160 }, kernel: Region { start: 1000000, len: 2abb78 }, ramdisk: Region { start: 12ac000, len: 0 }, config_file: Region { start: 12ac000, len: 0 }, last_used_addr: 12abfff, framebuffer: BiosFramebufferInfo { region: Region { start: fd000000, len: 2a3000 }, width: 500, height: 2d0, bytes_per_pixel: 3, stride: 500, pixel_format: Bgr }, memory_map_addr: 12148, memory_map_len: 7 }
+INFO : BIOS boot
+INFO : Elf file loaded at Pointer {
+    addr: 0x0000000001000000,
+    metadata: 2800504,
+}
+INFO : virtual_address_offset: 0x10000000000
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(4), offset: 0, virtual_addr: 0, physical_addr: 0, file_size: 6f04, mem_size: 6f04, align: 1000 })
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(5), offset: 6f10, virtual_addr: 7f10, physical_addr: 7f10, file_size: ce5f, mem_size: ce5f, align: 1000 })
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(6), offset: 13d70, virtual_addr: 15d70, physical_addr: 15d70, file_size: 1a58, mem_size: 2290, align: 1000 })
+INFO : Mapping bss section
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(6), offset: 157c8, virtual_addr: 187c8, physical_addr: 187c8, file_size: 2f78, mem_size: 1dc81, align: 1000 })
+INFO : Mapping bss section
+INFO : Entry point at: 0x1000000892e
+INFO : Creating GDT at PhysAddr(0x12ea000)
+INFO : Map framebuffer
+INFO : Map physical memory
+INFO : Allocate bootinfo
+INFO : Create Memory Map
+INFO : Create bootinfo
+INFO : Jumping to kernel entry point at VirtAddr(0x1000000892e)
+[    0.000] 
+[    0.000] [38;2;255;208;64m ____  _                     _   _ [0m
+[    0.000] [38;2;255;96;176m| __ )(_)___ _ __ ___  _   _| |_| |__ [0m
+[    0.000] [38;2;166;110;255m|  _ \| / __| '_ ` _ \| | | | __| '_ \ [0m
+[    0.000] [38;2;80;168;255m| |_) | \__ \ | | | | | |_| | |_| | | |[0m
+[    0.000] [38;2;64;224;176m|____/|_|___/_| |_| |_|\__,_|\__|_| |_|[0m
+[    0.000] 
+[    0.000] Bismuth 0.1.0 on x86-64 (QEMU) — stage 3: GDT/TSS + ring-3 user tasks
+[    0.000] virtio-blk-pci: device up, 32768 sectors
+[    0.000] virtio-blk-pci: sector round-trip OK
+[    0.001] [A] step 0
+[    0.001] [B] step 0
+[    0.002] [ring3] user task running unprivileged
+[    0.003] [ring3] sensor read ok; unauthorized write denied by the kernel
+[    0.003] [ring3] rogue task attempts to read another domain's memory...
+[    0.003] [done] waiting for ring-3 tasks...
+[    0.003] sandbox: exit=Ok(0) killed=false faults=0
+[    0.003] rogue:   killed=true faults=1
+[    0.003] x86-64 ring-3 demo complete: preemption, sandboxed syscalls, and per-domain memory isolation (a cross-domain read faulted and killed only the rogue) all verified. PASS

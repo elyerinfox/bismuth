@@ -115,6 +115,8 @@ fn enter(k: &mut Kernel, n: u8) -> u64 {
             super::gdt::set_kernel_stack(ks.top() as u64);
         }
     }
+    // Flip ring-3 page ownership so only this task's domain can reach its User pages.
+    super::paging::switch_ring3(t.domain);
     t.sp as u64
 }
 
@@ -277,9 +279,11 @@ pub(super) fn init_task(k: &mut Kernel, i: u8) {
             let kstack_top = t.kstack.as_ref().expect("user task without kernel stack").top() & !0xF;
             let ustack_top = ustack.top() & !0xF;
             let arg = t.arg;
-            // Open this task's own stack to ring 3 (its code already runs from the User-mapped
-            // kernel text). Kernel data and other tasks' stacks stay supervisor-only.
-            super::paging::open_user_range(ubase, ulen);
+            let domain = t.domain;
+            // Open this task's own stack to ring 3, owned by its domain (its code already runs
+            // from the User-mapped kernel text). Kernel data and other domains' stacks stay
+            // supervisor-only — and other ring-3 domains' stacks are demoted while this one runs.
+            super::paging::open_user_range(ubase, ulen, domain);
             // Seed the user stack with the return address for a cleanly-returning entry fn.
             let user_rsp = ustack_top - 8;
             // SAFETY: `user_rsp` is inside the task's own (User-mapped) stack.

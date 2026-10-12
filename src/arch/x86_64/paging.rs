@@ -24,7 +24,9 @@
 #![allow(unsafe_code)]
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+use crate::kernel::cell::IrqCell;
 
 const PAGE: u64 = 4096;
 const PRESENT: u64 = 1 << 0;
@@ -173,21 +175,121 @@ pub fn is_user_ro(addr: usize, end: usize) -> bool {
     }
 }
 
-/// Open a running task's own stack (`RW`/`NX` kernel `.bss`) to ring 3. Flushes the TLB.
-/// Returns whether every page in the range was present and opened (fails closed otherwise).
-pub fn open_user_range(start: u64, len: u64) -> bool {
+// ---- Per-domain ring-3 ownership ----------------------------------------------------------
+//
+// The kernel image's code/rodata are shared User-RO(-X) for every domain (so any ring-3 task
+// can execute the shared kernel text + `user::` shims), but a task's own User pages (its stack)
+// belong to ONE security domain. We record each opened range + its owner here, and on every
+// context switch promote only the incoming domain's ranges to User while demoting the outgoing
+// domain's to Supervisor-only. So two ring-3 domains can be live at once without either being
+// able to read or write the other's memory — the stage-1 analog of per-domain `CR3`, done by
+// flipping the leaf `U/S` bit in the single shared table (cheaper than per-domain tables here).
+// Mirrors the aarch64 `OWNED`/`switch_el0` design.
+
+/// Sentinel meaning "no ring-3 domain is currently promoted" (matches `kernel::NIL`).
+const NO_DOMAIN: u8 = u8::MAX;
+/// Maximum number of distinct owned User ranges (per-task stacks).
+const MAX_OWNED: usize = 24;
+
+#[derive(Copy, Clone)]
+struct Owned {
+    start: u64,
+    len: u64,
+    domain: u8,
+    used: bool,
+}
+
+const EMPTY_OWNED: Owned = Owned { start: 0, len: 0, domain: NO_DOMAIN, used: false };
+
+static OWNED: IrqCell<[Owned; MAX_OWNED]> = IrqCell::new([EMPTY_OWNED; MAX_OWNED]);
+/// The domain whose User ranges are currently promoted (a switch to the same domain is a no-op).
+static CURRENT_RING3: AtomicU8 = AtomicU8::new(NO_DOMAIN);
+
+/// Set the leaf `U/S` bit across `[start, start+len)`: `user` opens each page to ring 3 (sets
+/// `U/S` down the whole walk so the AND permits it), `!user` clears `U/S` on the **leaf only**
+/// (so sibling pages sharing the intermediate tables keep their own state). No TLB flush.
+fn set_user_pages(start: u64, len: u64, user: bool) {
+    let mut v = start & !(PAGE - 1);
+    let end = start + len;
+    while v < end {
+        if let Some(w) = walk(v) {
+            if user {
+                open(&w);
+            } else {
+                let leaf = w.chain[w.depth - 1];
+                // SAFETY: `leaf` is a present entry reached by `walk`; we clear only the U/S bit.
+                unsafe { leaf.write_volatile(leaf.read_volatile() & !USER) };
+            }
+        }
+        v += PAGE;
+    }
+}
+
+fn promote(o: &Owned) {
+    set_user_pages(o.start, o.len, true);
+}
+fn demote(o: &Owned) {
+    set_user_pages(o.start, o.len, false);
+}
+
+/// Record an owned User range for `domain` (replacing any existing record with the same start),
+/// and set its pages now: promoted if its domain is the one currently running at ring 3, else
+/// demoted (it becomes reachable only when the scheduler switches that domain in). Flushes.
+fn record(start: u64, len: u64, domain: u8) {
+    let o = Owned { start, len, domain, used: true };
+    OWNED.lock(|t| {
+        let slot = t.iter().position(|e| e.used && e.start == start).or_else(|| t.iter().position(|e| !e.used));
+        if let Some(i) = slot {
+            t[i] = o;
+        }
+    });
+    if domain == CURRENT_RING3.load(Ordering::Relaxed) {
+        promote(&o);
+    } else {
+        demote(&o);
+    }
+    flush_tlb();
+}
+
+/// Open a running task's own stack (`RW`/`NX` kernel `.bss`) to ring 3, owned by `domain`.
+/// Flushes the TLB. Returns whether every page in the range was present (fails closed otherwise).
+pub fn open_user_range(start: u64, len: u64, domain: u8) -> bool {
     let mut v = start & !(PAGE - 1);
     let end = start + len;
     let mut ok = true;
     while v < end {
-        match walk(v) {
-            Some(w) => open(&w),
-            None => ok = false,
+        if walk(v).is_none() {
+            ok = false;
         }
         v += PAGE;
     }
-    flush_tlb();
+    record(start, len, domain);
     ok
+}
+
+/// Switch the promoted ring-3 domain to `next` on a context switch: demote the outgoing domain's
+/// ranges and promote the incoming domain's, so only `next`'s User memory is reachable from ring
+/// 3. A no-op when the domain is unchanged. Called from the x86 context-switch path.
+pub fn switch_ring3(next: u8) {
+    let prev = CURRENT_RING3.load(Ordering::Relaxed);
+    if prev == next {
+        return;
+    }
+    OWNED.lock(|t| {
+        for e in t.iter() {
+            if !e.used {
+                continue;
+            }
+            if e.domain == prev {
+                demote(e);
+            }
+            if e.domain == next {
+                promote(e);
+            }
+        }
+    });
+    CURRENT_RING3.store(next, Ordering::Relaxed);
+    flush_tlb();
 }
 
 /// Translate a kernel virtual address to its physical address by walking the page tables — the
