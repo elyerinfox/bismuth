@@ -29,9 +29,79 @@ const UART_FR: usize = 0x18; // flag register; TXFF = bit 5
 const HVC_PRINT: u64 = 1;
 const HVC_EXIT: u64 = 2;
 
-/// Guest image RAM (the blob is copied here and executed at EL1) and the guest's EL1 stack.
-static mut GUEST_BUF: [u8; 8192] = [0; 8192];
-static mut GUEST_STACK: [u8; 8192] = [0; 8192];
+// ---- Stage 2: the guest's own guest-physical (IPA) address space ----
+//
+// The guest sees a 2 MiB RAM window at IPA `GUEST_IPA_BASE` (0x4000_0000, like a real `virt`
+// board), which stage-2 translation maps to the host-physical [`GUEST_RAM`] arena. Nothing else
+// is mapped, so any guest access outside that window faults to EL2. The guest runs at its IPA
+// base with its stack at the top of the window; the hypervisor converts a guest pointer back to
+// a host address with [`gpa_to_hpa`] before touching it.
+const GUEST_IPA_BASE: u64 = 0x4000_0000;
+const GUEST_RAM_SIZE: u64 = 0x20_0000; // 2 MiB
+
+/// A 2 MiB-aligned host-physical arena backing the guest's RAM (the blob is copied in at offset 0,
+/// the guest runs there at EL1, and its stack lives at the top).
+#[repr(C, align(0x200000))]
+struct GuestRam([u8; GUEST_RAM_SIZE as usize]);
+static mut GUEST_RAM: GuestRam = GuestRam([0; GUEST_RAM_SIZE as usize]);
+
+/// A page-aligned stage-2 translation table (512 × 8-byte descriptors).
+#[repr(C, align(4096))]
+struct S2Table([u64; 512]);
+static mut S2_L1: S2Table = S2Table([0; 512]); // level 1 (1 GiB per entry)
+static mut S2_L2: S2Table = S2Table([0; 512]); // level 2 (2 MiB per entry)
+
+/// Host-physical base of the guest RAM arena (stable: it is a static).
+fn guest_ram_hpa() -> u64 {
+    addr_of_mut!(GUEST_RAM) as u64
+}
+
+/// Translate a guest-physical address (IPA) to a host-physical address, if it falls in the guest's
+/// mapped RAM window. The hypervisor uses this to read/write guest memory a hypercall points at.
+fn gpa_to_hpa(ipa: u64) -> Option<u64> {
+    if (GUEST_IPA_BASE..GUEST_IPA_BASE + GUEST_RAM_SIZE).contains(&ipa) {
+        Some(guest_ram_hpa() + (ipa - GUEST_IPA_BASE))
+    } else {
+        None
+    }
+}
+
+/// Build the stage-2 tables mapping `[GUEST_IPA_BASE, +GUEST_RAM_SIZE)` → the guest RAM arena, and
+/// program `VTCR_EL2`/`VTTBR_EL2`, enabling stage-2 in `HCR_EL2.VM`. 4 KiB granule, 40-bit IPA,
+/// start level 1; the window is a single 2 MiB Normal-WB, read/write/exec block.
+fn setup_stage2() {
+    let arena = guest_ram_hpa();
+    // SAFETY: single-threaded EL2 bring-up; the tables and arena are ours alone.
+    unsafe {
+        let l1 = addr_of_mut!(S2_L1) as *mut u64;
+        let l2 = addr_of_mut!(S2_L2) as *mut u64;
+        for i in 0..512 {
+            l1.add(i).write_volatile(0);
+            l2.add(i).write_volatile(0);
+        }
+        // L2[0] = 2 MiB block → arena. Lower attrs: valid(1) | MemAttr=0b1111 Normal-WB(<<2) |
+        // S2AP=0b11 RW(<<6) | SH=0b11 inner(<<8) | AF(<<10) = 0x7FD; XN=0 (executable).
+        l2.add(0).write_volatile(arena | 0x7FD);
+        // L1[1] = table descriptor → L2 (IPA 0x4000_0000 has level-1 index 1).
+        l1.add(1).write_volatile((l2 as u64) | 0x3);
+
+        // VTCR_EL2: T0SZ=24 (40-bit IPA), SL0=1 (start L1), IRGN0/ORGN0=WB, SH0=inner, TG0=4KiB,
+        // PS=40-bit, bit31 RES1.
+        let vtcr: u64 = 0x8000_0000 | 24 | (1 << 6) | (1 << 8) | (1 << 10) | (3 << 12) | (2 << 16);
+        let vttbr = addr_of_mut!(S2_L1) as u64; // VMID 0
+        asm!(
+            "dsb ish",
+            "msr vtcr_el2, {vtcr}",
+            "msr vttbr_el2, {vttbr}",
+            "tlbi alle1is",
+            "dsb ish",
+            "isb",
+            vtcr = in(reg) vtcr,
+            vttbr = in(reg) vttbr,
+            options(nostack, preserves_flags),
+        );
+    }
+}
 
 /// Write one byte to the PL011, spinning while the TX FIFO is full.
 fn put(b: u8) {
@@ -170,12 +240,28 @@ extern "C" fn hvc_entry(frame: *const u64) {
     unsafe { asm!("mrs {}, esr_el2", out(reg) esr, options(nomem, nostack, preserves_flags)) };
     let ec = esr >> 26;
     if ec != 0x16 {
-        // Not an HVC — a genuine guest fault. Report and stop the VM.
-        let (elr, far): (u64, u64);
+        // Not an HVC — a genuine guest fault. A stage-2 abort (EC 0x24 data / 0x20 instruction
+        // from a lower EL) carries the faulting guest-physical address in HPFAR_EL2; report it
+        // specifically to prove the guest was confined to its mapped RAM, then stop the VM.
+        let (elr, far, hpfar): (u64, u64, u64);
         // SAFETY: reading EL2 fault registers is side-effect free.
         unsafe {
             asm!("mrs {}, elr_el2", out(reg) elr, options(nomem, nostack, preserves_flags));
             asm!("mrs {}, far_el2", out(reg) far, options(nomem, nostack, preserves_flags));
+            asm!("mrs {}, hpfar_el2", out(reg) hpfar, options(nomem, nostack, preserves_flags));
+        }
+        if ec == 0x24 || ec == 0x20 {
+            // Faulting IPA: HPFAR_EL2[43:4] = IPA[51:12]; combine with FAR_EL2's page offset.
+            let ipa = ((hpfar & 0xF_FFFF_FFF0) << 8) | (far & 0xFFF);
+            puts(b"[hyp] stage-2 fault: guest ");
+            puts(if ec == 0x24 { b"read/write" } else { b"exec" });
+            puts(b" of unmapped IPA=");
+            put_hex(ipa);
+            puts(b" (ELR_EL2=");
+            put_hex(elr);
+            puts(b") -- guest killed
+");
+            hyp_exit(1);
         }
         puts(b"[hyp] guest fault: ESR_EL2=");
         put_hex(esr);
@@ -191,10 +277,16 @@ extern "C" fn hvc_entry(frame: *const u64) {
     let (cmd, a1, a2) = unsafe { (*frame, *frame.add(1), *frame.add(2)) };
     match cmd {
         HVC_PRINT => {
-            // The guest owns the string in the shared physical space (stage 1 has no stage-2).
-            // SAFETY: MMU off → flat physical; the trusted guest passes a valid (ptr, len).
-            let s = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
-            puts(s);
+            // `a1` is a guest-physical address (IPA); translate it to a host address through the
+            // stage-2 window before reading, and bound the length to the guest's RAM.
+            match gpa_to_hpa(a1) {
+                Some(hpa) if a1 + a2 <= GUEST_IPA_BASE + GUEST_RAM_SIZE => {
+                    // SAFETY: [hpa, hpa+a2) lies within the guest RAM arena (bounds checked above).
+                    let s = unsafe { core::slice::from_raw_parts(hpa as *const u8, a2 as usize) };
+                    puts(s);
+                }
+                _ => puts(b"[hyp] rejected print: pointer outside guest RAM\n"),
+            }
         }
         HVC_EXIT => {
             puts(b"[hyp] guest requested exit, code ");
@@ -241,37 +333,48 @@ pub fn run_guest(blob: &[u8]) -> ! {
         hyp_exit(3);
     }
 
-    // Copy the guest into executable RAM and compute its entry + stack top.
-    let n = blob.len().min(8192);
-    // SAFETY: single-threaded EL2 bring-up; GUEST_BUF/STACK are ours alone.
-    let (entry, gsp) = unsafe {
-        let buf = addr_of_mut!(GUEST_BUF) as *mut u8;
+    // Copy the guest into the host-physical arena (at offset 0); the guest runs at its IPA base
+    // under stage-2, with its stack at the top of the IPA window.
+    let n = blob.len().min(GUEST_RAM_SIZE as usize);
+    // SAFETY: single-threaded EL2 bring-up; the arena is ours alone.
+    unsafe {
+        let buf = addr_of_mut!(GUEST_RAM) as *mut u8;
         for i in 0..n {
             core::ptr::write_volatile(buf.add(i), blob[i]);
         }
-        let stack_top = (addr_of_mut!(GUEST_STACK) as *mut u8).add(8192) as u64 & !0xf;
-        (buf as u64, stack_top)
-    };
+        asm!("dsb ish", options(nostack, preserves_flags));
+    }
+    let entry = GUEST_IPA_BASE; // guest-physical (IPA) entry
+    let gsp = (GUEST_IPA_BASE + GUEST_RAM_SIZE) & !0xf; // guest stack top (IPA)
 
-    puts(b"[hyp] launching guest at EL1, entry=");
+    // Build and enable the guest's stage-2 address space before entering it.
+    setup_stage2();
+
+    puts(b"[hyp] stage-2 on: guest RAM IPA=");
+    put_hex(GUEST_IPA_BASE);
+    puts(b"..+2MiB -> HPA=");
+    put_hex(guest_ram_hpa());
+    put(b'\n');
+    puts(b"[hyp] launching guest at EL1, entry IPA=");
     put_hex(entry);
     put(b'\n');
 
     let vbar = hyp_vectors as *const () as u64;
-    // SAFETY: install the EL2 vectors, make the guest AArch64 (HCR_EL2.RW), set its stack and
-    // return state, and `eret` into it at EL1. Control re-enters only via `VBAR_EL2` on a trap.
-    // (No asm outputs/scratch: `noreturn` forbids them, and the guest sets its own GPRs.)
+    // SAFETY: install the EL2 vectors, make the guest AArch64 + enable stage-2 (HCR_EL2.RW|VM),
+    // set its stack and return state, and `eret` into it at EL1. Control re-enters only via
+    // `VBAR_EL2` on a trap. (No asm outputs/scratch: `noreturn` forbids them.)
     unsafe {
         asm!(
             "msr vbar_el2, {vbar}",
             "isb",
-            "msr hcr_el2, {hcr}",     // HCR_EL2.RW = 1 -> EL1 is AArch64
+            "msr hcr_el2, {hcr}",     // HCR_EL2.RW=1 (EL1 AArch64) | VM=1 (stage-2 enabled)
             "msr sp_el1, {gsp}",
             "msr elr_el2, {entry}",
             "msr spsr_el2, {spsr}",   // EL1h, DAIF masked
+            "isb",
             "eret",
             vbar = in(reg) vbar,
-            hcr = in(reg) 0x8000_0000u64,
+            hcr = in(reg) 0x8000_0001u64,
             gsp = in(reg) gsp,
             entry = in(reg) entry,
             spsr = in(reg) 0x3c5u64,

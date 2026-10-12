@@ -67,10 +67,19 @@ interrupt injection. Guest EL0<->EL1 syscalls run natively and never trap to EL2
   guest shares the host's flat physical space and is trusted hand-assembled code. Proves the
   EL1-guest -> EL2-hypervisor mechanism. *(see `src/arch/aarch64/hyp.rs`, board `hypervisor`
   feature, `run-hv.sh`.)*
-- **S2 — EL2 MMU + stage-2 translation.** Turn on `SCTLR_EL2.M` (EL2's own identity map, so EL2
-  gets Normal cacheable RAM + atomics), and set up **stage-2** tables (`VTTBR_EL2`, `VTCR_EL2`) so
-  the guest sees a *guest-physical* space that Bismuth maps to a bounded host-physical RAM window
-  the guest cannot escape. This is the real memory isolation: a VM, not shared RAM.
+- **S2 — stage-2 translation (DONE).** Set up **stage-2** tables (`VTTBR_EL2`, `VTCR_EL2`, 4 KiB
+  granule / 40-bit IPA / start level 1) and enable them with `HCR_EL2.VM`, so the guest sees a
+  *guest-physical* RAM window at IPA `0x4000_0000` (2 MiB) that Bismuth maps to a bounded,
+  2 MiB-aligned host-physical arena (`GUEST_RAM`). Nothing else is mapped, so any guest access
+  outside the window takes a stage-2 abort to EL2 (`ESR_EL2.EC` 0x24/0x20), where the handler
+  reads the faulting IPA from `HPFAR_EL2`+`FAR_EL2` and kills the guest. The `HVC_PRINT` path now
+  translates the guest's IPA pointer to a host address (`gpa_to_hpa`) and bounds it to guest RAM
+  before reading. This is the real memory isolation: a VM, not shared RAM. EL2 itself is left
+  MMU-off (the guest's stage-1 is also off: VA=IPA, stage-2 does the real mapping), which is
+  enough for S2; an EL2 identity map (Normal cacheable RAM + atomics at EL2) is deferred to when
+  a later stage needs EL2-side cacheable state. **Verified in QEMU:** the guest R/W's its own
+  stage-2 RAM, then a read of unmapped IPA `0x5000_0000` traps to EL2 ("stage-2 fault: guest
+  read/write of unmapped IPA=0x50000000 — guest killed").
 - **S3 — vGIC + virtual timer.** Present the guest a GICv2/v3 it can program; inject virtual IRQs
   (`ICH_*`/list registers); trap+offset `CNTV`/route `CNTVCT` so the guest timer works. Needed
   before any interrupt-driven guest (i.e. any real OS).
