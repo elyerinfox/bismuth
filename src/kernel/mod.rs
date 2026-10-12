@@ -19,6 +19,36 @@ pub mod time;
 pub mod timer;
 pub(crate) mod usermem;
 
+/// Hook for the Linux-ABI personality (`compat::linux`): a loaded Linux task's `svc` traps route
+/// here instead of the Bismuth syscall gate. The handler lives in L4 and registers a function
+/// pointer, so the L0 trap path reaches it without importing upward.
+#[cfg(feature = "linux-abi")]
+pub mod linuxabi {
+    use super::cell::IrqCell;
+
+    /// What a Linux syscall does to the calling task.
+    pub enum Outcome {
+        /// Return this value in `x0`.
+        Return(i64),
+        /// Terminate the task with this exit code.
+        Exit(i32),
+    }
+
+    type Handler = fn(nr: u64, args: [u64; 6]) -> Outcome;
+    static HANDLER: IrqCell<Option<Handler>> = IrqCell::new(None);
+
+    /// Register the Linux syscall handler (once, at personality init).
+    pub fn register(h: Handler) {
+        HANDLER.lock(|s| *s = Some(h));
+    }
+
+    /// Dispatch a Linux syscall if a handler is registered.
+    pub fn dispatch(nr: u64, args: [u64; 6]) -> Option<Outcome> {
+        let f = HANDLER.lock(|h| *h);
+        f.map(|f| f(nr, args))
+    }
+}
+
 use cell::IrqCell;
 
 use crate::arch::port;
@@ -117,6 +147,11 @@ pub(crate) struct Tcb {
     /// Thread-local slots (backing for `pthread_key_*`).
     #[cfg_attr(not(feature = "posix"), allow(dead_code))]
     pub tls: [usize; 4],
+    /// A loaded Linux executable: its `svc` traps route to the Linux ABI, not Bismuth syscalls.
+    /// Only read on the `aarch64` trap path; inert elsewhere (host/other arches).
+    #[cfg(feature = "linux-abi")]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub is_linux: bool,
 }
 
 impl Tcb {
@@ -153,6 +188,8 @@ impl Tcb {
         notify_value: 0,
         notify_pending: false,
         tls: [0; 4],
+        #[cfg(feature = "linux-abi")]
+        is_linux: false,
     };
 }
 

@@ -199,6 +199,44 @@ extern "C" fn svc_entry(sp: u64) -> u64 {
     unsafe { asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack, preserves_flags)) };
     let ec = esr >> 26;
     if ec == 0x15 {
+        // A loaded Linux task (`linux-abi`) issues Linux-numbered `svc #0` (x8 = number,
+        // x0–x5 = args); route those to the Linux personality instead of the Bismuth gate.
+        #[cfg(feature = "linux-abi")]
+        if kernel::with(|k| k.cur().is_linux) {
+            // SAFETY: `f` is the saved GPR image this handler just pushed.
+            let (nr, largs) = unsafe {
+                (
+                    f.add(8).read(),
+                    [f.read(), f.add(1).read(), f.add(2).read(), f.add(3).read(), f.add(4).read(), f.add(5).read()],
+                )
+            };
+            // Unmask IRQs while the syscall runs (console writes, reschedule).
+            // SAFETY: re-enabling interrupts on the task's kernel stack.
+            unsafe { asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)) };
+            let out = kernel::linuxabi::dispatch(nr, largs);
+            // SAFETY: re-masking before touching the saved frame.
+            unsafe { asm!("msr daifset, #2", options(nomem, nostack, preserves_flags)) };
+            match out {
+                Some(kernel::linuxabi::Outcome::Return(v)) => {
+                    // SAFETY: write the result into the saved x0 slot for the `ERET`.
+                    unsafe { f.write(v as u64) };
+                    return sp;
+                }
+                _ => {
+                    // Exit (or no handler): retire the task and schedule another.
+                    let d = kernel::with(|k| {
+                        let cur = k.current;
+                        crate::security::DomainId(k.tasks[cur as usize].domain)
+                    });
+                    kernel::with(|k| k.retire(k.current, usize::MAX));
+                    let _ = crate::security::kill_internal(d);
+                    return kernel::with(|k| {
+                        let n = k.schedule();
+                        super::enter(k, n)
+                    });
+                }
+            }
+        }
         // SVC: x8 = number, x0–x3 = args. Record the call + saved user context on the task.
         // SAFETY: `f` is the saved GPR image this handler just pushed.
         let (n, args, sp_el0, spsr) = unsafe {

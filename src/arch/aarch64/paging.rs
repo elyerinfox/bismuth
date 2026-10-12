@@ -259,6 +259,30 @@ pub fn open_user_range(start: u64, len: u64) -> bool {
     ok
 }
 
+/// Open a range as EL0 **read + execute** (`AP = 11`, `UXN = 0`, `PXN = 1`) — for a loaded
+/// program's code placed in a kernel-image `.bss` buffer (the Linux-ABI / native-bundle loader).
+/// The region must already hold the code (written while it was EL1-RW). Fails closed off-image.
+#[cfg(feature = "linux-abi")]
+pub fn open_user_exec(start: u64, len: u64) -> bool {
+    let mut v = start & !(PAGE - 1);
+    let end = start + len;
+    let mut ok = true;
+    while v < end {
+        match l3_entry(v) {
+            Some(e) => {
+                // SAFETY: `e` is a level-3 entry in our tables.
+                let d = unsafe { e.read_volatile() };
+                let na = (d & !(0b11 << 6) & !UXN & !PXN) | AP_EL0_RO | PXN; // EL0 RO+exec, EL1 no-exec
+                unsafe { e.write_volatile(na) };
+            }
+            None => ok = false,
+        }
+        v += PAGE;
+    }
+    flush_tlb();
+    ok
+}
+
 /// Whether every page in `[addr, end)` is EL0 **read-only** (`AP = 11`) — kernel text/rodata,
 /// never writable kernel state or a task stack. Validates read-only user pointers at the
 /// syscall boundary.
