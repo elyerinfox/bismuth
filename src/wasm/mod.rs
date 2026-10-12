@@ -25,7 +25,14 @@ const MAX_STEPS: u64 = 50_000_000;
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Host {
     FdWrite,
+    FdRead,
     ProcExit,
+    EnvironSizesGet,
+    EnvironGet,
+    ArgsSizesGet,
+    ArgsGet,
+    ClockTimeGet,
+    RandomGet,
     Unknown,
 }
 
@@ -167,7 +174,14 @@ impl Module {
                                 let ti = r.u32()?; // type index
                                 let host = match field {
                                     "fd_write" => Host::FdWrite,
+                                    "fd_read" => Host::FdRead,
                                     "proc_exit" => Host::ProcExit,
+                                    "environ_sizes_get" => Host::EnvironSizesGet,
+                                    "environ_get" => Host::EnvironGet,
+                                    "args_sizes_get" => Host::ArgsSizesGet,
+                                    "args_get" => Host::ArgsGet,
+                                    "clock_time_get" => Host::ClockTimeGet,
+                                    "random_get" => Host::RandomGet,
                                     _ => Host::Unknown,
                                 };
                                 imports.push((host, ti));
@@ -325,12 +339,56 @@ impl Module {
         if nresults == 0 { Ok(None) } else { Ok(stack.pop()) }
     }
 
-    /// A WASI host call. Minimal preview-1: `fd_write` to the console and `proc_exit`.
+    /// A WASI host call (preview-1 subset): console I/O, exit, empty args/env, clock and random —
+    /// enough to run a `wasm32-wasi` program's start-up and a `println!`-style workload.
     fn host_call(&self, which: Host, args: &[i32], ctx: &mut Ctx) -> Result<Option<i32>, Error> {
+        // Little-endian stores into linear memory, bounds-checked.
+        let put32 = |ctx: &mut Ctx, at: usize, v: u32| {
+            if at + 4 <= ctx.mem.len() {
+                ctx.mem[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        };
         match which {
             Host::ProcExit => {
                 ctx.exit = Some(*args.first().unwrap_or(&0));
                 Ok(None)
+            }
+            // No environment and no args: report zero counts/sizes; the *_get calls are no-ops.
+            Host::EnvironSizesGet | Host::ArgsSizesGet => {
+                put32(ctx, args[0] as usize, 0); // count
+                put32(ctx, args[1] as usize, 0); // buffer size
+                Ok(Some(0))
+            }
+            Host::EnvironGet | Host::ArgsGet => Ok(Some(0)),
+            Host::ClockTimeGet => {
+                // clock_time_get(id, precision, time_ptr) -> errno; write nanoseconds since boot.
+                let ns = crate::kernel::time::ms_since_boot().saturating_mul(1_000_000);
+                let at = args[2] as usize;
+                if at + 8 <= ctx.mem.len() {
+                    ctx.mem[at..at + 8].copy_from_slice(&ns.to_le_bytes());
+                }
+                Ok(Some(0))
+            }
+            Host::RandomGet => {
+                // random_get(buf, buf_len) -> errno; fill with a SplitMix-style stream seeded from
+                // the monotonic clock (adequate for wasm; not a CSPRNG).
+                let (buf, len) = (args[0] as usize, args[1] as usize);
+                let mut x = crate::kernel::time::ms_since_boot().wrapping_add(0x9E37_79B9_7F4A_7C15);
+                for i in 0..len {
+                    if buf + i >= ctx.mem.len() {
+                        break;
+                    }
+                    x ^= x >> 30;
+                    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    x ^= x >> 27;
+                    ctx.mem[buf + i] = (x >> 33) as u8;
+                }
+                Ok(Some(0))
+            }
+            Host::FdRead => {
+                // fd_read(fd, iovs, iovs_len, nread) -> errno; no stdin → report 0 bytes (EOF).
+                put32(ctx, args[3] as usize, 0);
+                Ok(Some(0))
             }
             Host::FdWrite => {
                 // fd_write(fd, iovs, iovs_len, nwritten) -> errno. Gather the iovecs from linear

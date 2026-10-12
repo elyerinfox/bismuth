@@ -142,3 +142,24 @@ fn wasi_fd_write_gathers_iovecs_and_reports_bytes() {
     // Writes "hi" to the console (fd 1) and reports 2 bytes written back through memory.
     assert_eq!(m.invoke("wtest", &[]).unwrap(), Some(2));
 }
+
+// (import environ_sizes_get) (memory 1) (func (export "e") (result i32)
+//   i32.const 0  i32.const 4  call 0  drop   i32.const 0  i32.load)  ;; returns the env count
+const ENVIRON: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x0b, 0x02, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, 0x60, 0x00, 0x01, 0x7f, // t0 (i32,i32)->i32, t1 ()->i32
+    0x02, 0x2c, 0x01, 0x16, b'w', b'a', b's', b'i', b'_', b's', b'n', b'a', b'p', b's', b'h', b'o', b't', b'_', b'p',
+    b'r', b'e', b'v', b'i', b'e', b'w', b'1', 0x11, b'e', b'n', b'v', b'i', b'r', b'o', b'n', b'_', b's', b'i', b'z',
+    b'e', b's', b'_', b'g', b'e', b't', 0x00, 0x00,
+    0x03, 0x02, 0x01, 0x01, // func type 1
+    0x05, 0x03, 0x01, 0x00, 0x01, // memory 1
+    0x07, 0x05, 0x01, 0x01, b'e', 0x00, 0x01, // export "e" -> func 1
+    0x0a, 0x10, 0x01, 0x0e, 0x00, 0x41, 0x00, 0x41, 0x04, 0x10, 0x00, 0x1a, 0x41, 0x00, 0x28, 0x02, 0x00, 0x0b,
+];
+
+#[test]
+fn wasi_environ_sizes_get_reports_empty_environment() {
+    let m = Module::parse(ENVIRON).unwrap();
+    // environ_sizes_get wrote count=0 at mem[0]; the function returns it.
+    assert_eq!(m.invoke("e", &[]).unwrap(), Some(0));
+}
