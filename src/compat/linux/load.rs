@@ -23,15 +23,23 @@ use crate::kernel::task::{self, TaskId};
 use crate::security::{self, DomainId};
 
 #[cfg(feature = "fs")]
-use crate::fs::{File, OpenMode};
+use crate::fs::{Dir, File, OpenMode};
 #[cfg(feature = "fs")]
 use crate::security::DirCap;
+
+/// An open descriptor ≥ 3: a regular file or a directory opened for iteration (`getdents64`).
+#[cfg(feature = "fs")]
+#[derive(Copy, Clone)]
+enum Fd {
+    File(File),
+    Dir(Dir),
+}
 
 /// Per-process address-space buffer size (code + data + stack + heap).
 const IMAGE_BYTES: usize = 128 * 1024;
 const PAGE: usize = 4096;
 /// How many Linux processes (one per domain) can be loaded at once.
-const MAX_PROCS: usize = 4;
+const MAX_PROCS: usize = 5;
 #[cfg(feature = "fs")]
 const MAX_FDS: usize = 8;
 #[cfg(feature = "fs")]
@@ -57,7 +65,7 @@ pub struct Proc {
     /// `mmap` bump pointer, descending from the top of the arena toward `brk_cur`.
     mmap_cur: u64,
     #[cfg(feature = "fs")]
-    fds: [Option<File>; MAX_FDS],
+    fds: [Option<Fd>; MAX_FDS],
 }
 
 const MAP_ANONYMOUS: u64 = 0x20;
@@ -144,6 +152,10 @@ fn handle(nr: u64, args: [u64; 6]) -> Outcome {
         _ => {}
     }
 
+    if let Some(out) = time_syscall(i, nr, args) {
+        return out;
+    }
+
     #[cfg(feature = "fs")]
     if let Some(out) = fs_syscall(i, nr, args) {
         return out;
@@ -154,6 +166,70 @@ fn handle(nr: u64, args: [u64; 6]) -> Outcome {
     match out {
         syscall::Outcome::Return(v) => Outcome::Return(v),
         syscall::Outcome::Exit(c) => Outcome::Exit(c),
+    }
+}
+
+/// Read `n` little-endian `u64`s from the process buffer at vaddr `ptr` (bounds-checked).
+fn read_u64s(i: usize, ptr: u64, out: &mut [u64]) -> bool {
+    let base = PROCS.lock(|p| p[i].base);
+    let Some(off) = ptr.checked_sub(base).map(|x| x as usize) else { return false };
+    IMAGES[i].lock(|img| {
+        for (k, slot) in out.iter_mut().enumerate() {
+            let Some(b) = img.0.get(off + k * 8..off + k * 8 + 8) else { return false };
+            *slot = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+        }
+        true
+    })
+}
+
+/// Write little-endian `u64`s to the process buffer at vaddr `ptr` (bounds-checked).
+fn write_u64s(i: usize, ptr: u64, vals: &[u64]) -> bool {
+    let base = PROCS.lock(|p| p[i].base);
+    let Some(off) = ptr.checked_sub(base).map(|x| x as usize) else { return false };
+    IMAGES[i].lock(|img| {
+        for (k, v) in vals.iter().enumerate() {
+            let Some(b) = img.0.get_mut(off + k * 8..off + k * 8 + 8) else { return false };
+            b.copy_from_slice(&v.to_le_bytes());
+        }
+        true
+    })
+}
+
+/// Time-related syscalls that read/write the process buffer: `nanosleep`/`clock_nanosleep` block
+/// the task for the requested duration; `gettimeofday` reports time since boot. `None` falls
+/// through to the other handlers.
+fn time_syscall(i: usize, nr: u64, a: [u64; 6]) -> Option<Outcome> {
+    const NANOSLEEP: u64 = 101;
+    const CLOCK_NANOSLEEP: u64 = 115;
+    const GETTIMEOFDAY: u64 = 169;
+
+    match nr {
+        NANOSLEEP | CLOCK_NANOSLEEP => {
+            // nanosleep(req, rem); clock_nanosleep(clockid, flags, req, rem).
+            let req = if nr == NANOSLEEP { a[0] } else { a[2] };
+            let mut ts = [0u64; 2]; // { tv_sec, tv_nsec }
+            if !read_u64s(i, req, &mut ts) {
+                return Some(Outcome::Return(-14)); // EFAULT
+            }
+            let ms = ts[0].saturating_mul(1000).saturating_add(ts[1] / 1_000_000);
+            let ticks = crate::kernel::time::ms_to_ticks(ms);
+            task::sleep_ticks(ticks as u64);
+            Some(Outcome::Return(0))
+        }
+        GETTIMEOFDAY => {
+            // gettimeofday(tv, tz): struct timeval { i64 tv_sec; i64 tv_usec }.
+            let tv = a[0];
+            if tv == 0 {
+                return Some(Outcome::Return(0));
+            }
+            let ms = crate::kernel::time::ms_since_boot() as u64;
+            if write_u64s(i, tv, &[ms / 1000, (ms % 1000) * 1000]) {
+                Some(Outcome::Return(0))
+            } else {
+                Some(Outcome::Return(-14))
+            }
+        }
+        _ => None,
     }
 }
 
@@ -254,6 +330,7 @@ pub fn load_and_run(bin: &[u8], name: &'static str, prio: u8, domain: DomainId) 
 fn fs_syscall(i: usize, nr: u64, a: [u64; 6]) -> Option<Outcome> {
     const OPENAT: u64 = 56;
     const CLOSE: u64 = 57;
+    const GETDENTS64: u64 = 61;
     const LSEEK: u64 = 62;
     const READ: u64 = 63;
     const WRITE: u64 = 64;
@@ -266,6 +343,7 @@ fn fs_syscall(i: usize, nr: u64, a: [u64; 6]) -> Option<Outcome> {
         READ if a[0] >= FIRST_FD as u64 => Some(rw(i, a, false)),
         WRITE if a[0] >= FIRST_FD as u64 => Some(rw(i, a, true)),
         CLOSE if a[0] >= FIRST_FD as u64 => Some(close(i, a[0])),
+        GETDENTS64 if a[0] >= FIRST_FD as u64 => Some(getdents64(i, a)),
         LSEEK if a[0] >= FIRST_FD as u64 => Some(lseek(i, a)),
         FSTAT if a[0] >= FIRST_FD as u64 => Some(fstat(i, a[0], a[1])),
         // newfstatat(dirfd, path, statbuf, flags): with an empty path + AT_EMPTY_PATH it stats the
@@ -296,12 +374,21 @@ fn write_stat(mem: &mut [u8], off: usize, st: &crate::fs::Stat) -> bool {
     true
 }
 
+/// Fetch the regular `File` behind a descriptor, or `None` if the slot is empty or a directory.
+#[cfg(feature = "fs")]
+fn file_at(i: usize, fd: u64) -> Option<File> {
+    let slot = (fd as i64 - FIRST_FD) as usize;
+    PROCS.lock(|p| if slot < MAX_FDS { p[i].fds[slot] } else { None }).and_then(|f| match f {
+        Fd::File(file) => Some(file),
+        Fd::Dir(_) => None,
+    })
+}
+
 #[cfg(feature = "fs")]
 fn lseek(i: usize, a: [u64; 6]) -> Outcome {
     use crate::fs::SeekFrom;
     let (fd, off, whence) = (a[0], a[1] as i64, a[2]);
-    let slot = (fd as i64 - FIRST_FD) as usize;
-    let Some(file) = PROCS.lock(|p| if slot < MAX_FDS { p[i].fds[slot] } else { None }) else {
+    let Some(file) = file_at(i, fd) else {
         return Outcome::Return(-9);
     };
     let from = match whence {
@@ -318,8 +405,7 @@ fn lseek(i: usize, a: [u64; 6]) -> Outcome {
 
 #[cfg(feature = "fs")]
 fn fstat(i: usize, fd: u64, statbuf: u64) -> Outcome {
-    let slot = (fd as i64 - FIRST_FD) as usize;
-    let Some(file) = PROCS.lock(|p| if slot < MAX_FDS { p[i].fds[slot] } else { None }) else {
+    let Some(file) = file_at(i, fd) else {
         return Outcome::Return(-9);
     };
     let Ok(st) = crate::fs::fstat(file) else { return Outcome::Return(-5) };
@@ -383,6 +469,8 @@ fn openat(i: usize, a: [u64; 6]) -> Outcome {
     const O_TRUNC: u64 = 0o1000;
     const O_APPEND: u64 = 0o2000;
 
+    const O_DIRECTORY: u64 = 0o40000; // aarch64: 0x4000
+
     let (dirfd, path_ptr, flags) = (a[0] as i64, a[1], a[2]);
     if dirfd != AT_FDCWD {
         return Outcome::Return(-9); // EBADF: only AT_FDCWD (relative to the jail) supported
@@ -392,44 +480,118 @@ fn openat(i: usize, a: [u64; 6]) -> Outcome {
     let Some(n) = read_cstr(i, path_ptr, &mut pbuf) else { return Outcome::Return(-36) };
     let Ok(path) = core::str::from_utf8(&pbuf[..n]) else { return Outcome::Return(-22) };
 
-    let mut mode = if flags & O_WRONLY != 0 {
-        OpenMode::WRITE
-    } else if flags & O_RDWR != 0 {
-        OpenMode::RDWR
+    // A directory open (for getdents64) resolves through the confined cap_opendir.
+    let fd = if flags & O_DIRECTORY != 0 {
+        match crate::fs::cap_opendir(&cap, path) {
+            Ok(d) => Fd::Dir(d),
+            Err(Error::NotADirectory) => return Outcome::Return(-20), // ENOTDIR
+            Err(_) => return Outcome::Return(-2),                     // ENOENT
+        }
     } else {
-        OpenMode::READ
-    };
-    if flags & O_CREAT != 0 {
-        mode = mode.with(OpenMode::CREATE);
-    }
-    if flags & O_TRUNC != 0 {
-        mode = mode.with(OpenMode::TRUNC);
-    }
-    if flags & O_APPEND != 0 {
-        mode = mode.with(OpenMode::APPEND);
-    }
-
-    let file = match crate::fs::cap_open(&cap, path, mode) {
-        Ok(f) => f,
-        Err(_) => return Outcome::Return(-2), // ENOENT
+        let mut mode = if flags & O_WRONLY != 0 {
+            OpenMode::WRITE
+        } else if flags & O_RDWR != 0 {
+            OpenMode::RDWR
+        } else {
+            OpenMode::READ
+        };
+        if flags & O_CREAT != 0 {
+            mode = mode.with(OpenMode::CREATE);
+        }
+        if flags & O_TRUNC != 0 {
+            mode = mode.with(OpenMode::TRUNC);
+        }
+        if flags & O_APPEND != 0 {
+            mode = mode.with(OpenMode::APPEND);
+        }
+        match crate::fs::cap_open(&cap, path, mode) {
+            Ok(f) => Fd::File(f),
+            Err(_) => return Outcome::Return(-2), // ENOENT
+        }
     };
     PROCS.lock(|p| {
         for (slot, cell) in p[i].fds.iter_mut().enumerate() {
             if cell.is_none() {
-                *cell = Some(file);
+                *cell = Some(fd);
                 return Outcome::Return(FIRST_FD + slot as i64);
             }
         }
-        crate::fs::close(file);
+        close_fd(fd);
         Outcome::Return(-24) // EMFILE
     })
+}
+
+/// Close whichever kind of VFS handle a descriptor holds.
+#[cfg(feature = "fs")]
+fn close_fd(fd: Fd) {
+    match fd {
+        Fd::File(f) => crate::fs::close(f),
+        Fd::Dir(d) => crate::fs::closedir(d),
+    }
+}
+
+/// `getdents64(fd, buf, count)`: pack Linux `struct linux_dirent64` records (d_ino:u64, d_off:i64,
+/// d_reclen:u16, d_type:u8, d_name[]: NUL-terminated, each record 8-byte aligned) into the user
+/// buffer, advancing the directory's cursor. Returns bytes written, or 0 at end of directory.
+#[cfg(feature = "fs")]
+fn getdents64(i: usize, a: [u64; 6]) -> Outcome {
+    use crate::fs::{DirEntry, NodeKind};
+    const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
+
+    let (fd, ptr, count) = (a[0], a[1], a[2] as usize);
+    let slot = (fd as i64 - FIRST_FD) as usize;
+    let Some(Fd::Dir(dir)) = PROCS.lock(|p| if slot < MAX_FDS { p[i].fds[slot] } else { None }) else {
+        return Outcome::Return(-20); // ENOTDIR (not an open directory)
+    };
+    let base = PROCS.lock(|p| p[i].base);
+    let Some(off) = ptr.checked_sub(base).map(|x| x as usize) else { return Outcome::Return(-14) };
+
+    let mut written = 0usize;
+    let mut e = DirEntry::default();
+    loop {
+        // Snapshot the cursor before reading, so a non-fitting entry can be re-read next call.
+        let Ok(cursor) = crate::fs::telldir(dir) else { return Outcome::Return(-5) };
+        let more = match crate::fs::readdir(dir, &mut e) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(_) => return Outcome::Return(-5),
+        };
+        if !more {
+            break;
+        }
+        let name = e.name();
+        let reclen = (19 + name.len() + 1 + 7) & !7; // 8+8+2+1 header + name + NUL, 8-aligned
+        if written + reclen > count {
+            // No room: rewind to this entry so the next getdents64 re-reads it.
+            crate::fs::seekdir(dir, cursor);
+            break;
+        }
+        let d_type = if e.kind == NodeKind::Dir { DT_DIR } else { DT_REG };
+        let ok = IMAGES[i].lock(|img| {
+            let Some(rec) = img.0.get_mut(off + written..off + written + reclen) else { return false };
+            for b in rec.iter_mut() {
+                *b = 0;
+            }
+            rec[0..8].copy_from_slice(&(e.vnode.0 as u64).to_le_bytes()); // d_ino
+            rec[8..16].copy_from_slice(&(written as i64 + reclen as i64).to_le_bytes()); // d_off
+            rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes()); // d_reclen
+            rec[18] = d_type;
+            rec[19..19 + name.len()].copy_from_slice(name.as_bytes());
+            true
+        });
+        if !ok {
+            return Outcome::Return(-14);
+        }
+        written += reclen;
+    }
+    Outcome::Return(written as i64)
 }
 
 #[cfg(feature = "fs")]
 fn rw(i: usize, a: [u64; 6], write: bool) -> Outcome {
     let (fd, ptr, len) = (a[0], a[1], a[2] as usize);
-    let slot = (fd as i64 - FIRST_FD) as usize;
-    let Some(file) = PROCS.lock(|p| if slot < MAX_FDS { p[i].fds[slot] } else { None }) else {
+    let Some(file) = file_at(i, fd) else {
         return Outcome::Return(-9);
     };
     let base = PROCS.lock(|p| p[i].base);
@@ -454,10 +616,10 @@ fn rw(i: usize, a: [u64; 6], write: bool) -> Outcome {
 #[cfg(feature = "fs")]
 fn close(i: usize, fd: u64) -> Outcome {
     let slot = (fd as i64 - FIRST_FD) as usize;
-    let file = PROCS.lock(|p| if slot < MAX_FDS { p[i].fds[slot].take() } else { None });
-    match file {
+    let fdv = PROCS.lock(|p| if slot < MAX_FDS { p[i].fds[slot].take() } else { None });
+    match fdv {
         Some(f) => {
-            crate::fs::close(f);
+            close_fd(f);
             Outcome::Return(0)
         }
         None => Outcome::Return(-9),

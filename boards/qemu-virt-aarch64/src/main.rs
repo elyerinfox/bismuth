@@ -31,6 +31,8 @@ mod linux_elf;
 #[cfg(feature = "linux-demo")]
 mod linux_mmap;
 #[cfg(feature = "linux-demo")]
+mod linux_ls;
+#[cfg(feature = "linux-demo")]
 mod linux_spin;
 #[cfg(feature = "linux-demo")]
 mod linux_write;
@@ -412,6 +414,8 @@ static LXS2: Stack<8192> = Stack::new();
 static LXS3: Stack<8192> = Stack::new();
 #[cfg(feature = "linux-demo")]
 static LXS4: Stack<8192> = Stack::new();
+#[cfg(feature = "linux-demo")]
+static LXS5: Stack<8192> = Stack::new();
 
 /// A container's root task: load its Linux binary and enter it at EL0 in this container's domain.
 /// The launcher returns once the EL0 task is spawned; the container lives until that task exits.
@@ -440,6 +444,10 @@ fn lx_mmap(_: usize) {
 #[cfg(feature = "linux-demo")]
 fn lx_write(_: usize) {
     lx_launch(&linux_write::WRITE_ELF, "write");
+}
+#[cfg(feature = "linux-demo")]
+fn lx_ls(_: usize) {
+    lx_launch(&linux_ls::LS_ELF, "ls");
 }
 
 /// Three Linux binaries, each packaged as a container: an isolated domain (two task slots: the
@@ -497,6 +505,20 @@ static LINUX_MANIFEST: bismuth::security::container::ContainerManifest = {
                 on_fault: OnFault::Stop,
                 image_hash: [0; 32],
             },
+            // A container that lists its root directory via getdents64 (a Linux "ls").
+            ContainerDecl {
+                domain: DomainDecl {
+                    spec: DomainSpec::isolated("lxls", 4, 2),
+                    grants: &[],
+                    dirs: &[DirGrantDecl { path: "/", name: "root", rights: Rights::READ }],
+                },
+                entry: ContainerEntry::privileged(lx_ls, 3, &LXS5),
+                version: 1,
+                cpu: None,
+                ram_bytes: 131072,
+                on_fault: OnFault::Stop,
+                image_hash: [0; 32],
+            },
         ],
         supervisor: None,
     }
@@ -519,9 +541,10 @@ fn linux_demo() {
     let f = fs::open("/greeting.txt", OpenMode::RDWR.with(OpenMode::CREATE)).unwrap();
     fs::write(f, b"[file] Hello from a VFS file, read by a Linux container at EL0!\n").unwrap();
     fs::close(f);
+    fs::mkdir("/bin").unwrap(); // a second entry so the "ls" container has more than one to list
 
     container::install(&LINUX_MANIFEST).unwrap(); // creates domains, applies dir grants, seals
-    for name in ["lxspin", "lxcat", "lxmmap", "lxwrite"] {
+    for name in ["lxspin", "lxcat", "lxmmap", "lxwrite", "lxls"] {
         let c = container::find(name).unwrap();
         kprintln!("[linux] starting container '{name}'");
         container::start(c).unwrap();
@@ -570,7 +593,7 @@ fn linux_monitor(_: usize) {
         }
         fs::close(f);
     }
-    kprintln!("aarch64 Linux-container demo complete: four Linux binaries ran as containers — a CPU-bound spinner (cpu cgroup), a VFS reader (lseek), a heap allocator (mmap), and a file writer — with per-container cpu/memory cgroups. PASS");
+    kprintln!("aarch64 Linux-container demo complete: five Linux binaries ran as containers — a CPU-bound spinner (cpu cgroup), a VFS reader (lseek), a heap allocator (mmap), a file writer, and a directory lister (getdents64) — with per-container cpu/memory cgroups. PASS");
     bismuth::arch::aarch64::qemu_exit(0);
 }
 
