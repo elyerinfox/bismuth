@@ -1,6 +1,0 @@
-[build]
-target = "aarch64-unknown-none-softfloat"
-
-[target.aarch64-unknown-none-softfloat]
-runner = "qemu-system-aarch64 -M raspi3b -nographic -semihosting -kernel"
-rustflags = ["-C", "link-arg=-Tlink.ld"]
