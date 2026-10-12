@@ -28,6 +28,8 @@ use bismuth::{Stack, TaskId, Timeout, UserStack2K, kprintln, task, user};
 mod linux_cat;
 #[cfg(feature = "linux-demo")]
 mod linux_elf;
+#[cfg(feature = "linux-demo")]
+mod linux_mmap;
 
 #[cfg(feature = "linux-demo")]
 static LINUXFS: bismuth::fs::RamFs<16, 64, 64> = bismuth::fs::RamFs::new();
@@ -37,6 +39,8 @@ static SLX: Stack<16384> = Stack::new();
 static LX_D1: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "linux-demo")]
 static LX_D2: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "linux-demo")]
+static LX_D3: AtomicU32 = AtomicU32::new(0);
 
 /// The one place hardware addresses are asserted. QEMU `virt`: PL011 UART0 at 0x0900_0000,
 /// routed to GIC SPI 1 (interrupt 32 + 1).
@@ -420,10 +424,12 @@ fn linux_demo() {
     // Two sandboxed domains: a normal `exit` tears its domain down, so each binary gets its own.
     let d1 = security::create_domain(DomainSpec::sandboxed("linux1", 4, 1)).unwrap();
     let d2 = security::create_domain(DomainSpec::sandboxed("linux2", 4, 1)).unwrap();
+    let d3 = security::create_domain(DomainSpec::sandboxed("linux3", 4, 1)).unwrap();
     fs::grant_dir(d2, "/", Rights::READ, "root").unwrap(); // the file reader's confined root
     security::seal().unwrap();
     LX_D1.store(d1.0 as u32, Ordering::Relaxed);
     LX_D2.store(d2.0 as u32, Ordering::Relaxed);
+    LX_D3.store(d3.0 as u32, Ordering::Relaxed);
     task::spawn("linuxdrv", 1, &SLX, linux_driver, 0).unwrap();
 }
 
@@ -456,7 +462,19 @@ fn linux_driver(_: usize) {
         }
     }
 
-    kprintln!("aarch64 Linux-ABI demo complete: two EL0 Linux binaries ran — a write loop and a VFS file reader via openat/read/write. PASS");
+    let d3 = DomainId(LX_D3.load(Ordering::Relaxed) as u8);
+    kprintln!("[linux] #3: a binary that mmap()s a page, fills it, and writes it");
+    match load_and_run(&linux_mmap::MMAP_ELF, "mmap", 2, d3) {
+        Ok(t) => {
+            let _ = task::join(t, Timeout::ms(5000));
+        }
+        Err(e) => {
+            kprintln!("[linux] #3 load failed: {e:?}");
+            bismuth::arch::aarch64::qemu_exit(1);
+        }
+    }
+
+    kprintln!("aarch64 Linux-ABI demo complete: three EL0 Linux binaries ran — a write loop, a VFS file reader (openat/read/write), and a heap allocator (mmap). PASS");
     bismuth::arch::aarch64::qemu_exit(0);
 }
 

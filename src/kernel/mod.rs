@@ -27,6 +27,7 @@ pub mod linuxabi {
     use super::cell::IrqCell;
 
     /// What a Linux syscall does to the calling task.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Outcome {
         /// Return this value in `x0`.
         Return(i64),

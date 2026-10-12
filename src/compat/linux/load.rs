@@ -38,6 +38,9 @@ static IMAGE_BASE: IrqCell<u64> = IrqCell::new(0);
 /// calls are served here (they need the fd table + VFS), everything else by the pure dispatcher.
 /// Both read and write the one process buffer through a `&mut [u8]` view.
 fn handle(nr: u64, args: [u64; 6]) -> linuxabi::Outcome {
+    if let Some(out) = mm::handle_mm(nr, args) {
+        return out;
+    }
     #[cfg(feature = "fs")]
     if let Some(out) = fd::handle_fs(nr, args) {
         return out;
@@ -47,6 +50,78 @@ fn handle(nr: u64, args: [u64; 6]) -> linuxabi::Outcome {
     match out {
         syscall::Outcome::Return(v) => linuxabi::Outcome::Return(v),
         syscall::Outcome::Exit(c) => linuxabi::Outcome::Exit(c),
+    }
+}
+
+/// `brk` and anonymous `mmap`/`munmap` over the process buffer's read-write arena. `brk` grows a
+/// classic heap up from the bottom of the arena; anonymous `mmap` bump-allocates pages down from
+/// the top. Both are already backed by real, EL0-read-write pages (the loader opened the whole
+/// arena), so there is no faulting-in — just pointer bookkeeping within the fixed buffer. Enough
+/// for a `malloc` built on either primitive. One task at a time → one set of statics.
+pub mod mm {
+    use crate::kernel::cell::IrqCell;
+    use crate::kernel::linuxabi::Outcome;
+
+    const BRK: u64 = 214;
+    const MUNMAP: u64 = 215;
+    const MMAP: u64 = 222;
+
+    const MAP_ANONYMOUS: u64 = 0x20;
+    const PAGE: u64 = 4096;
+    const MAP_FAILED: i64 = -1;
+
+    /// Bottom of the arena / the program break's floor (the heap's start).
+    static HEAP_START: IrqCell<u64> = IrqCell::new(0);
+    /// The current program break (top of the `brk` heap).
+    static BRK_CUR: IrqCell<u64> = IrqCell::new(0);
+    /// The bump pointer for anonymous `mmap`, growing down from the top of the arena.
+    static MMAP_CUR: IrqCell<u64> = IrqCell::new(0);
+
+    /// Set the arena `[start, top)` for a freshly loaded task.
+    pub fn init(start: u64, top: u64) {
+        HEAP_START.lock(|v| *v = start);
+        BRK_CUR.lock(|v| *v = start);
+        MMAP_CUR.lock(|v| *v = top & !(PAGE - 1));
+    }
+
+    /// Serve a memory-management syscall, or `None` for the other handlers.
+    pub fn handle_mm(nr: u64, a: [u64; 6]) -> Option<Outcome> {
+        match nr {
+            BRK => Some(brk(a[0])),
+            MMAP => Some(mmap(a)),
+            MUNMAP => Some(Outcome::Return(0)), // bump allocator: free is a no-op
+            _ => None,
+        }
+    }
+
+    fn brk(req: u64) -> Outcome {
+        let (start, floor) = (HEAP_START.lock(|v| *v), MMAP_CUR.lock(|v| *v));
+        // brk(0) (or any address below the heap start) just queries the current break.
+        if req < start {
+            return Outcome::Return(BRK_CUR.lock(|v| *v) as i64);
+        }
+        if req > floor {
+            // Out of arena: Linux leaves the break unchanged and returns it.
+            return Outcome::Return(BRK_CUR.lock(|v| *v) as i64);
+        }
+        BRK_CUR.lock(|v| *v = req);
+        Outcome::Return(req as i64)
+    }
+
+    fn mmap(a: [u64; 6]) -> Outcome {
+        let (len, flags) = (a[1], a[3]);
+        if flags & MAP_ANONYMOUS == 0 || len == 0 {
+            return Outcome::Return(MAP_FAILED); // only anonymous maps are backed here
+        }
+        let need = (len + PAGE - 1) & !(PAGE - 1);
+        let floor = BRK_CUR.lock(|v| *v);
+        MMAP_CUR.lock(|cur| match cur.checked_sub(need) {
+            Some(n) if n >= floor => {
+                *cur = n;
+                Outcome::Return(n as i64)
+            }
+            _ => Outcome::Return(MAP_FAILED), // arena exhausted
+        })
     }
 }
 
@@ -103,6 +178,11 @@ pub fn load_and_run(bin: &[u8], name: &'static str, prio: u8, domain: DomainId) 
     if !port::open_linux_image((image_addr, span as u64), (rw_start, rw_len)) {
         return Err(Error::Unsupported);
     }
+
+    // The heap/anonymous-mmap arena is the read-write region between the loaded image and a guard
+    // below the initial stack: `brk` grows up from the bottom, `mmap` bump-allocates down from the
+    // top; they fail when they would meet.
+    mm::init(rw_start, (sp & !(PAGE as u64 - 1)) - PAGE as u64);
 
     // Route Linux syscalls here, then spawn the task at EL0.
     linuxabi::register(handle);
