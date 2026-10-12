@@ -12,18 +12,18 @@
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use smoltcp::socket::{tcp, udp};
+use smoltcp::socket::{icmp, tcp, udp};
 
 use super::buf::{MAX_FRAME, PacketBuf};
 use super::ip::{self, Stack};
 use super::{APP_POOL, IfIndex, schedule};
 use crate::Error;
-use crate::config::{NET_IP_IFACES, NET_TCP_SOCKETS, NET_UDP_SOCKETS};
+use crate::config::{NET_ICMP_SOCKETS, NET_IP_IFACES, NET_TCP_SOCKETS, NET_UDP_SOCKETS};
 use crate::kernel::cell::IrqCell;
 use crate::kernel::time::Timeout;
 use crate::sync::{EventFlags, Queue, WaitMode};
 
-const PER_IFACE: usize = NET_UDP_SOCKETS + NET_TCP_SOCKETS;
+const PER_IFACE: usize = NET_UDP_SOCKETS + NET_TCP_SOCKETS + NET_ICMP_SOCKETS;
 const MAX_SLOTS: usize = NET_IP_IFACES * PER_IFACE;
 const SLOT_QUEUE: usize = 4;
 
@@ -35,6 +35,7 @@ const EV_CLOSED: u32 = 1 << 2;
 enum Kind {
     Udp,
     Tcp,
+    Icmp,
 }
 
 #[derive(Copy, Clone)]
@@ -75,6 +76,7 @@ enum Cmd {
     UdpBind { slot: u8, port: u16 },
     TcpConnect { slot: u8, remote: SocketAddrV4, local_port: u16 },
     TcpListen { slot: u8, port: u16 },
+    IcmpBind { slot: u8, ident: u16 },
     Close { slot: u8 },
 }
 
@@ -84,7 +86,13 @@ static EPHEMERAL: AtomicU16 = AtomicU16::new(49152);
 /// `(instance, kind, index within kind)` of a slot.
 fn decode(slot: usize) -> (usize, Kind, usize) {
     let (inst, off) = (slot / PER_IFACE, slot % PER_IFACE);
-    if off < NET_UDP_SOCKETS { (inst, Kind::Udp, off) } else { (inst, Kind::Tcp, off - NET_UDP_SOCKETS) }
+    if off < NET_UDP_SOCKETS {
+        (inst, Kind::Udp, off)
+    } else if off < NET_UDP_SOCKETS + NET_TCP_SOCKETS {
+        (inst, Kind::Tcp, off - NET_UDP_SOCKETS)
+    } else {
+        (inst, Kind::Icmp, off - NET_UDP_SOCKETS - NET_TCP_SOCKETS)
+    }
 }
 
 fn free_slot(slot: usize) {
@@ -348,6 +356,78 @@ impl Drop for TcpListener {
     }
 }
 
+/// An ICMP socket — ping, and other ICMP echo exchanges. Bound to an identifier so the stack
+/// routes matching echo replies to it.
+pub struct IcmpSocket {
+    slot: usize,
+    ident: u16,
+}
+
+impl IcmpSocket {
+    /// Open an ICMP socket bound to `ident` on the first IP interface.
+    pub fn open(ident: u16) -> Result<Self, Error> {
+        Self::open_on(ip::default_iface()?, ident)
+    }
+
+    pub fn open_on(idx: IfIndex, ident: u16) -> Result<Self, Error> {
+        crate::security::check_net(None, None, false)?;
+        let slot = claim(idx, Kind::Icmp)?;
+        if let Err(e) = command(slot, Cmd::IcmpBind { slot: slot as u8, ident }) {
+            free_slot(slot);
+            return Err(e);
+        }
+        Ok(IcmpSocket { slot, ident })
+    }
+
+    /// Send one ICMP echo request (a ping) to `dst` with sequence `seq` and `payload`.
+    pub fn ping(&self, dst: Ipv4Addr, seq: u16, payload: &[u8]) -> Result<(), Error> {
+        use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr};
+        let repr = Icmpv4Repr::EchoRequest { ident: self.ident, seq_no: seq, data: payload };
+        let len = repr.buffer_len();
+        let mut buf = [0u8; 128];
+        if len > buf.len() {
+            return Err(Error::Overflow);
+        }
+        // Emit with checksum left zero; the net core fills ICMP/IP checksums for non-offload NICs.
+        let mut pkt = Icmpv4Packet::new_unchecked(&mut buf[..len]);
+        repr.emit(&mut pkt, &smoltcp::phy::ChecksumCapabilities::ignored());
+        let mut p = APP_POOL.alloc_from(&buf[..len], Timeout::Forever)?;
+        p.meta.peer = Some((dst.octets(), 0));
+        SLOTS[self.slot].tx.send(p, Timeout::Forever).map_err(|e| e.error)?;
+        schedule();
+        Ok(())
+    }
+
+    /// Receive one raw ICMP packet; returns its length and source address.
+    pub fn recv(&self, buf: &mut [u8], timeout: Timeout) -> Result<(usize, Ipv4Addr), Error> {
+        let p = SLOTS[self.slot].rx.recv(timeout)?;
+        let n = p.len().min(buf.len());
+        buf[..n].copy_from_slice(&p.data()[..n]);
+        let (ip, _) = p.meta.peer.unwrap_or(([0; 4], 0));
+        Ok((n, Ipv4Addr::from(ip)))
+    }
+
+    /// Wait for an echo reply whose sequence is `seq`; returns the responder's address.
+    pub fn recv_reply(&self, seq: u16, timeout: Timeout) -> Result<Ipv4Addr, Error> {
+        use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr};
+        let mut buf = [0u8; 128];
+        let (n, from) = self.recv(&mut buf, timeout)?;
+        let pkt = Icmpv4Packet::new_checked(&buf[..n]).map_err(|_| Error::Io)?;
+        let repr = Icmpv4Repr::parse(&pkt, &smoltcp::phy::ChecksumCapabilities::ignored()).map_err(|_| Error::Io)?;
+        match repr {
+            Icmpv4Repr::EchoReply { seq_no, .. } if seq_no == seq => Ok(from),
+            _ => Err(Error::NotReady),
+        }
+    }
+}
+
+impl Drop for IcmpSocket {
+    fn drop(&mut self) {
+        let _ = command(self.slot, Cmd::Close { slot: self.slot as u8 });
+        free_slot(self.slot);
+    }
+}
+
 /// Readiness of a socket slot for `poll()`: (readable, writable).
 pub(crate) fn readiness(slot: usize) -> (bool, bool) {
     let s = &SLOTS[slot];
@@ -396,6 +476,8 @@ impl NetSide {
                 Kind::Udp if st.closing => {}
                 Kind::Udp => self.udp(stack, slot, i),
                 Kind::Tcp => self.tcp(stack, slot, i, st),
+                Kind::Icmp if st.closing => {}
+                Kind::Icmp => self.icmp(stack, slot, i),
             }
         }
     }
@@ -410,6 +492,7 @@ impl NetSide {
             Cmd::UdpBind { slot, .. }
             | Cmd::TcpConnect { slot, .. }
             | Cmd::TcpListen { slot, .. }
+            | Cmd::IcmpBind { slot, .. }
             | Cmd::Close { slot } => slot as usize,
         };
         let (inst, kind, i) = decode(slot);
@@ -431,6 +514,9 @@ impl NetSide {
                 SLOTS[slot].state.lock(|s| s.local_port = port);
                 stack.sockets.get_mut::<tcp::Socket<'_>>(stack.tcp[i]).listen(port).map_err(|_| Error::Invalid)
             }
+            (Cmd::IcmpBind { ident, .. }, Kind::Icmp) => {
+                stack.sockets.get_mut::<icmp::Socket<'_>>(stack.icmp[i]).bind(icmp::Endpoint::Ident(ident)).map_err(|_| Error::Exists)
+            }
             (Cmd::Close { .. }, Kind::Udp) => {
                 stack.sockets.get_mut::<udp::Socket<'_>>(stack.udp[i]).close();
                 // Stop servicing it; the closing task frees the slot after `EV_DONE`.
@@ -438,6 +524,10 @@ impl NetSide {
                 Ok(())
             }
             (Cmd::Close { .. }, Kind::Tcp) => {
+                SLOTS[slot].state.lock(|s| s.closing = true);
+                Ok(())
+            }
+            (Cmd::Close { .. }, Kind::Icmp) => {
                 SLOTS[slot].state.lock(|s| s.closing = true);
                 Ok(())
             }
@@ -466,6 +556,36 @@ impl NetSide {
                     #[allow(irrefutable_let_patterns)]
                     if let smoltcp::wire::IpAddress::Ipv4(a) = meta.endpoint.addr {
                         p.meta.peer = Some((a.octets(), meta.endpoint.port));
+                    }
+                    let _ = s.rx.try_send(p);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn icmp(&mut self, stack: &mut Stack<'_>, slot: usize, i: usize) {
+        let s = &SLOTS[slot];
+        let sock = stack.sockets.get_mut::<icmp::Socket<'_>>(stack.icmp[i]);
+        // Application -> wire: each queued buffer is a fully-formed ICMP packet for `peer`.
+        while sock.can_send() {
+            let Ok(p) = s.tx.try_recv() else { break };
+            if let Some((addr, _)) = p.meta.peer {
+                let _ = sock.send_slice(p.data(), ip::endpoint(addr, 0).addr);
+            }
+        }
+        // Wire -> application: deliver received ICMP packets (e.g. echo replies).
+        while sock.can_recv() && !s.rx.is_full() {
+            let Ok(mut p) = APP_POOL.try_alloc() else {
+                self.busy = true;
+                break;
+            };
+            match sock.recv_slice(p.rx_space()) {
+                Ok((n, addr)) => {
+                    let _ = p.set_len(n);
+                    #[allow(irrefutable_let_patterns)]
+                    if let smoltcp::wire::IpAddress::Ipv4(a) = addr {
+                        p.meta.peer = Some((a.octets(), 0));
                     }
                     let _ = s.rx.try_send(p);
                 }

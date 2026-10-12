@@ -105,6 +105,8 @@ pub const NET_IP_IFACES: usize = parse_or(option_env!("BISMUTH_NET_IP_IFACES"), 
 pub const NET_UDP_SOCKETS: usize = parse_or(option_env!("BISMUTH_NET_UDP_SOCKETS"), mcu_or_host(2, 4));
 /// TCP sockets per IP interface.
 pub const NET_TCP_SOCKETS: usize = parse_or(option_env!("BISMUTH_NET_TCP_SOCKETS"), mcu_or_host(2, 4));
+/// ICMP (ping) sockets per IP interface.
+pub const NET_ICMP_SOCKETS: usize = parse_or(option_env!("BISMUTH_NET_ICMP_SOCKETS"), mcu_or_host(1, 2));
 /// Bytes of receive and of transmit buffer per socket.
 pub const NET_SOCKET_BUF: usize = parse_or(option_env!("BISMUTH_NET_SOCKET_BUF"), mcu_or_host(1024, 4096));
 /// Stack size of the net task (holds the IP stack's socket storage).

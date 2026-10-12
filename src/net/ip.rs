@@ -11,7 +11,7 @@
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{self, ChecksumCapabilities, DeviceCapabilities, Medium};
-use smoltcp::socket::{tcp, udp};
+use smoltcp::socket::{icmp, tcp, udp};
 use smoltcp::time::Instant as SInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
@@ -19,7 +19,7 @@ use super::buf::{MAX_FRAME, PacketBuf};
 use super::socket;
 use super::{Core, IfIndex, TX_POOL, with_if};
 use crate::Error;
-use crate::config::{MAX_NETIFS, NET_IP_IFACES, NET_IP_RXQ, NET_SOCKET_BUF, NET_TCP_SOCKETS, NET_UDP_SOCKETS};
+use crate::config::{MAX_NETIFS, NET_ICMP_SOCKETS, NET_IP_IFACES, NET_IP_RXQ, NET_SOCKET_BUF, NET_TCP_SOCKETS, NET_UDP_SOCKETS};
 use crate::kernel::cell::IrqCell;
 use crate::kernel::time::{self, ms_to_ticks};
 use crate::sync::Queue;
@@ -152,7 +152,25 @@ impl TcpStore {
     const EMPTY: TcpStore = TcpStore { rx: [0; NET_SOCKET_BUF], tx: [0; NET_SOCKET_BUF] };
 }
 
-const SOCKETS: usize = NET_UDP_SOCKETS + NET_TCP_SOCKETS;
+const ICMP_META: usize = 4;
+
+struct IcmpStore {
+    rx_meta: [icmp::PacketMetadata; ICMP_META],
+    rx: [u8; NET_SOCKET_BUF],
+    tx_meta: [icmp::PacketMetadata; ICMP_META],
+    tx: [u8; NET_SOCKET_BUF],
+}
+
+impl IcmpStore {
+    const EMPTY: IcmpStore = IcmpStore {
+        rx_meta: [icmp::PacketMetadata::EMPTY; ICMP_META],
+        rx: [0; NET_SOCKET_BUF],
+        tx_meta: [icmp::PacketMetadata::EMPTY; ICMP_META],
+        tx: [0; NET_SOCKET_BUF],
+    };
+}
+
+const SOCKETS: usize = NET_UDP_SOCKETS + NET_TCP_SOCKETS + NET_ICMP_SOCKETS;
 
 /// One IP stack instance bound to one interface.
 pub(crate) struct Stack<'a> {
@@ -161,6 +179,7 @@ pub(crate) struct Stack<'a> {
     pub(crate) sockets: SocketSet<'a>,
     pub(crate) udp: [SocketHandle; NET_UDP_SOCKETS],
     pub(crate) tcp: [SocketHandle; NET_TCP_SOCKETS],
+    pub(crate) icmp: [SocketHandle; NET_ICMP_SOCKETS],
 }
 
 fn ipv4(a: [u8; 4]) -> Ipv4Address {
@@ -181,6 +200,7 @@ impl<'a> Stack<'a> {
         cfg: IpConfig,
         udp_store: &'a mut [UdpStore; NET_UDP_SOCKETS],
         tcp_store: &'a mut [TcpStore; NET_TCP_SOCKETS],
+        icmp_store: &'a mut [IcmpStore; NET_ICMP_SOCKETS],
         sock_store: &'a mut [SocketStorage<'a>; SOCKETS],
     ) -> Result<Self, Error> {
         let info = super::info(idx)?;
@@ -216,7 +236,13 @@ impl<'a> Stack<'a> {
             let tx = tcp::SocketBuffer::new(&mut s.tx[..]);
             *h = sockets.add(tcp::Socket::new(rx, tx));
         }
-        Ok(Stack { dev, iface, sockets, udp, tcp })
+        let mut icmp = [SocketHandle::default(); NET_ICMP_SOCKETS];
+        for (h, s) in icmp.iter_mut().zip(icmp_store.iter_mut()) {
+            let rx = icmp::PacketBuffer::new(&mut s.rx_meta[..], &mut s.rx[..]);
+            let tx = icmp::PacketBuffer::new(&mut s.tx_meta[..], &mut s.tx[..]);
+            *h = sockets.add(icmp::Socket::new(rx, tx));
+        }
+        Ok(Stack { dev, iface, sockets, udp, tcp, icmp })
     }
 
     fn poll(&mut self) {
@@ -234,6 +260,7 @@ pub(crate) fn run() {
     let mut core = Core::new();
     let mut udp_store = [const { [const { UdpStore::EMPTY }; NET_UDP_SOCKETS] }; NET_IP_IFACES];
     let mut tcp_store = [const { [const { TcpStore::EMPTY }; NET_TCP_SOCKETS] }; NET_IP_IFACES];
+    let mut icmp_store = [const { [const { IcmpStore::EMPTY }; NET_ICMP_SOCKETS] }; NET_IP_IFACES];
     let mut sock_store = [const { [SocketStorage::EMPTY; SOCKETS] }; NET_IP_IFACES];
 
     // Create one IP instance per IP-configured interface, in interface order.
@@ -241,9 +268,11 @@ pub(crate) fn run() {
         .map(IfIndex)
         .filter_map(|i| with_if(i, |e| e.ip).ok().flatten().map(|c| (i, c)));
     let mut stacks: [Option<Stack<'_>>; NET_IP_IFACES] = [const { None }; NET_IP_IFACES];
-    for (k, ((us, ts), ss)) in udp_store.iter_mut().zip(tcp_store.iter_mut()).zip(sock_store.iter_mut()).enumerate() {
+    for (k, (((us, ts), is), ss)) in
+        udp_store.iter_mut().zip(tcp_store.iter_mut()).zip(icmp_store.iter_mut()).zip(sock_store.iter_mut()).enumerate()
+    {
         let Some((idx, cfg)) = configured.next() else { break };
-        if let Ok(st) = Stack::new(idx, cfg, us, ts, ss) {
+        if let Ok(st) = Stack::new(idx, cfg, us, ts, is, ss) {
             INSTANCES.lock(|m| m[k] = Some(idx));
             stacks[k] = Some(st);
         }

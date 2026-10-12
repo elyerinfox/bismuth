@@ -227,6 +227,17 @@ fn net_demo() {
             kprintln!("virtio-net: iface stats rx_packets={} tx_packets={}", s.rx_packets, s.tx_packets);
         }
     }
+    // A self-contained IP round-trip: ICMP echo to the SLIRP gateway (10.0.2.2), which answers
+    // locally without any outbound internet — proving ICMP + IPv4 receive end to end.
+    if let Ok(sock) = bismuth::net::socket::IcmpSocket::open(0x42) {
+        let gw = Ipv4Addr::new(10, 0, 2, 2);
+        if sock.ping(gw, 1, b"bismuth").is_ok() {
+            match sock.recv_reply(1, Timeout::ms(3000)) {
+                Ok(from) => kprintln!("virtio-net: ICMP echo reply from {from} — ping round-trip OK"),
+                Err(e) => kprintln!("virtio-net: no ICMP reply ({e:?})"),
+            }
+        }
+    }
 }
 
 // ---- Interactive container host (`--features interactive`): install a real container and drop
