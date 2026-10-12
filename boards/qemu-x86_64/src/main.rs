@@ -151,7 +151,9 @@ static SNET: Stack<16384> = Stack::new();
 /// pre-existing x86 fault — the yield-gate `int 0x81` `#GP` — that is out of scope for the driver.)
 #[cfg(feature = "net-demo")]
 fn net_only(_: usize) {
-    use bismuth::net::device::FrameDevice;
+    use bismuth::net::ip::{self, IpConfig};
+    use core::net::Ipv4Addr;
+
     if let Err(e) = NIC.inner().probe() {
         kprintln!("virtio-net-pci: no device ({e:?})");
         bismuth::arch::x86_64::debug_exit(1);
@@ -162,51 +164,39 @@ fn net_only(_: usize) {
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
 
-    // A broadcast ARP request: who-has 10.0.2.2 (the SLIRP gateway), tell 10.0.2.15.
-    let mut frame = [0u8; 42];
-    frame[0..6].copy_from_slice(&[0xff; 6]); // dst = broadcast
-    frame[6..12].copy_from_slice(&mac); // src
-    frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes()); // ethertype ARP
-    frame[14..16].copy_from_slice(&0x0001u16.to_be_bytes()); // htype Ethernet
-    frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes()); // ptype IPv4
-    frame[18] = 6; // hlen
-    frame[19] = 4; // plen
-    frame[20..22].copy_from_slice(&0x0001u16.to_be_bytes()); // oper = request
-    frame[22..28].copy_from_slice(&mac); // sender MAC
-    frame[28..32].copy_from_slice(&[10, 0, 2, 15]); // sender IP
-    frame[38..42].copy_from_slice(&[10, 0, 2, 2]); // target IP
-
-    if let Err(e) = NIC.inner().send(&frame) {
-        kprintln!("virtio-net-pci: ARP send failed ({e:?})");
-        bismuth::arch::x86_64::debug_exit(1);
-    }
-    kprintln!("virtio-net-pci: sent broadcast ARP who-has 10.0.2.2");
-
-    // Poll the RX ring for the gateway's ARP reply.
-    let mut buf = [0u8; 1536];
-    let mut got = None;
-    for _ in 0..2000 {
-        if let Some(n) = NIC.inner().recv(&mut buf) {
-            if n >= 42 && buf[12] == 0x08 && buf[13] == 0x06 && buf[21] == 0x02 {
-                got = Some((n, [buf[22], buf[23], buf[24], buf[25], buf[26], buf[27]]));
-                break;
-            }
-        }
-        task::sleep_ticks(1);
-    }
-    match got {
-        Some((n, rmac)) => {
-            kprintln!(
-                "virtio-net-pci: ARP reply ({n} bytes) 10.0.2.2 is-at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} — TX+RX round-trip verified. PASS",
-                rmac[0], rmac[1], rmac[2], rmac[3], rmac[4], rmac[5]
-            );
-            bismuth::arch::x86_64::debug_exit(0);
-        }
-        None => {
-            kprintln!("virtio-net-pci: no ARP reply received");
+    let idx = match bismuth::net::register("eth0", &NIC) {
+        Ok(i) => i,
+        Err(e) => {
+            kprintln!("virtio-net-pci: register failed ({e:?})");
             bismuth::arch::x86_64::debug_exit(1);
         }
+    };
+    let cfg = IpConfig { addr: [10, 0, 2, 15], prefix_len: 24, gateway: Some([10, 0, 2, 2]) };
+    if let Err(e) = ip::configure(idx, cfg) {
+        kprintln!("virtio-net-pci: IP configure failed ({e:?})");
+        bismuth::arch::x86_64::debug_exit(1);
     }
+    let _ = bismuth::net::start();
+    kprintln!("virtio-net-pci: eth0 up, 10.0.2.15/24 gw 10.0.2.2 — IP stack running");
+
+    // ICMP echo to the SLIRP gateway (answered locally, no outbound internet needed).
+    if let Ok(sock) = bismuth::net::socket::IcmpSocket::open(0x42) {
+        let gw = Ipv4Addr::new(10, 0, 2, 2);
+        if sock.ping(gw, 1, b"bismuth").is_ok() {
+            match sock.recv_reply(1, Timeout::ms(3000)) {
+                Ok(from) => {
+                    kprintln!("virtio-net-pci: ICMP echo reply from {from} — IP-stack round-trip verified. PASS");
+                    bismuth::arch::x86_64::debug_exit(0);
+                }
+                Err(e) => kprintln!("virtio-net-pci: no ICMP reply ({e:?})"),
+            }
+        } else {
+            kprintln!("virtio-net-pci: ping send failed");
+        }
+    } else {
+        kprintln!("virtio-net-pci: ICMP socket open failed");
+    }
+    bismuth::arch::x86_64::debug_exit(1);
 }
 
 fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {

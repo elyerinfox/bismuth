@@ -182,6 +182,30 @@ extern "C" fn syscall_entry(rsp: u64) {
 
 /// Page-fault handler. A fault from ring 3 (or any user-stack overflow) kills just the
 /// offending domain and schedules another task; a fault in the kernel is fatal and halts.
+/// General-protection fault (#GP, vector 13): report the error code, faulting CS (CPL) and RIP,
+/// then halt. Diagnostic — a kernel #GP is fatal.
+#[unsafe(naked)]
+pub extern "C" fn gp_isr() {
+    naked_asm!(
+        save_gprs!(),
+        "mov rdi, rsp",
+        "call {entry}",
+        "2:",
+        "hlt",
+        "jmp 2b",
+        entry = sym gp_entry,
+    )
+}
+
+extern "C" fn gp_entry(rsp: u64) {
+    let f = rsp as *mut u64;
+    // [15]=error code, [16]=RIP, [17]=CS, [18]=RFLAGS (error-code exception frame).
+    // SAFETY: `f` points at the pushed GPR image followed by the CPU's error-code frame.
+    let (err, rip, cs, rflags) = unsafe { (f.add(15).read(), f.add(16).read(), f.add(17).read(), f.add(18).read()) };
+    super::console_sink("\n*** x86 #GP (general protection) — kernel halted ***\n");
+    crate::kprintln!("  err={err:#x} RIP={rip:#018x} CS={cs:#x} (CPL={}) RFLAGS={rflags:#x}", cs & 3);
+}
+
 #[unsafe(naked)]
 pub extern "C" fn page_fault_isr() {
     naked_asm!(

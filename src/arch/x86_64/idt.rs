@@ -70,6 +70,7 @@ pub fn init() {
         for v in 0..32 {
             (*idt)[v] = GateDescriptor::new(fault_stub as *const () as usize, cs);
         }
+        (*idt)[13] = GateDescriptor::new(super::sw::gp_isr as *const () as usize, cs); // #GP diagnostic
         (*idt)[VEC_PF] = GateDescriptor::new(super::sw::page_fault_isr as *const () as usize, cs);
         (*idt)[VEC_TIMER] = GateDescriptor::new(super::sw::timer_isr as *const () as usize, cs);
         (*idt)[VEC_YIELD] = GateDescriptor::new(super::sw::yield_isr as *const () as usize, cs);

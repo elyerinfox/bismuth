@@ -1,2 +1,9 @@
 [build]
 target = "x86_64-unknown-none"
+
+# The networking task runs the full IP stack (ARP/IPv4/ICMP/UDP + sockets) in its poll loop;
+# in an unoptimized x86-64 debug build those frames exceed the default 16 KiB task stack, so the
+# net task needs a larger stack (there is no hardware guard page — an overflow silently corrupts
+# a neighbouring task's saved switch frame). 64 KiB is comfortably clear on this board.
+[env]
+BISMUTH_NET_STACK_SIZE = "65536"
