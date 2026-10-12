@@ -129,6 +129,12 @@ pub fn supports_user_tasks() -> bool {
     paging::ready()
 }
 
+/// Loading Linux images is not supported on this port (aarch64 EL0 only); fails closed.
+#[cfg(feature = "linux-abi")]
+pub fn open_linux_image(_code: (u64, u64), _stack: (u64, u64)) -> bool {
+    false
+}
+
 /// Whether an unprivileged task may have the kernel read `[addr, end)` as read-only data: the
 /// kernel's User-mapped, non-writable pages (text + rodata). Writable kernel state (supervisor)
 /// and task stacks (writable) are excluded — the latter are checked separately as "own stack".

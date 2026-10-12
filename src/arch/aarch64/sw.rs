@@ -158,8 +158,21 @@ pub(super) fn init_task(k: &mut Kernel, i: u8) {
             let (ubase, ulen, utop) = (ustack.base() as u64, ustack.len() as u64, (ustack.top() as u64) & !0xF);
             let kstack_top = t.kstack.as_ref().expect("user task without kernel stack").top() & !0xF;
             let arg = t.arg;
-            // Open the task's own stack to EL0 (its code runs from the EL0-mapped kernel text).
-            super::paging::open_user_range(ubase, ulen);
+            // A loaded Linux executable enters at its ELF entry with its own SysV stack (both in
+            // the EL0-exec image buffer, opened by the loader); a native EL0 task enters its Rust
+            // entry with its own pool stack opened to EL0 here.
+            #[cfg(feature = "linux-abi")]
+            let (entry_pc, sp_el0) = if t.is_linux {
+                (t.linux_entry as u64, t.linux_sp as u64)
+            } else {
+                super::paging::open_user_range(ubase, ulen);
+                (entry as *const () as u64, utop)
+            };
+            #[cfg(not(feature = "linux-abi"))]
+            let (entry_pc, sp_el0) = {
+                super::paging::open_user_range(ubase, ulen);
+                (entry as *const () as u64, utop)
+            };
             let sp = kstack_top - 272;
             let f = sp as *mut u64;
             // SAFETY: the frame lies inside the task's private kernel stack.
@@ -169,8 +182,8 @@ pub(super) fn init_task(k: &mut Kernel, i: u8) {
                 }
                 f.add(0).write(arg as u64); // x0 = arg
                 f.add(30).write(crate::user::user_task_return as *const () as u64); // x30 = LR
-                f.add(31).write(utop); // SP_EL0 = user stack top
-                f.add(32).write(entry as *const () as u64); // ELR_EL1 = user entry
+                f.add(31).write(sp_el0); // SP_EL0 = user stack top
+                f.add(32).write(entry_pc); // ELR_EL1 = user entry
                 f.add(33).write(0x0); // SPSR_EL1 = EL0t (use SP_EL0), DAIF all enabled
             }
             t.sp = sp;

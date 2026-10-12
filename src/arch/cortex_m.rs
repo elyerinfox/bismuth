@@ -247,6 +247,12 @@ pub fn supports_user_tasks() -> bool {
     mpu_present()
 }
 
+/// Loading Linux images is not supported on this port (aarch64 EL0 only); fails closed.
+#[cfg(feature = "linux-abi")]
+pub fn open_linux_image(_code: (u64, u64), _stack: (u64, u64)) -> bool {
+    false
+}
+
 fn mpu_present() -> bool {
     // SAFETY: MPU_TYPE is a read-only System Control Space register.
     unsafe { (MPU_TYPE.read_volatile() >> 8) & 0xFF >= 2 }

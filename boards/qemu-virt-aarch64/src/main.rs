@@ -11,7 +11,10 @@
 // The board has three mutually exclusive top-level flows — the default EL0 isolation demo, the
 // `net-demo` networking flow, and the `interactive` container host + shell — so whichever is not
 // selected is legitimately unused in that build.
-#![cfg_attr(any(feature = "net-demo", feature = "interactive"), allow(dead_code, unused_imports))]
+#![cfg_attr(
+    any(feature = "net-demo", feature = "interactive", feature = "linux-demo"),
+    allow(dead_code, unused_imports)
+)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -20,6 +23,9 @@ use bismuth::driver::sensor::SimSensor;
 use bismuth::driver::{self, Device, DeviceDesc, FACTORIES, char::pl011};
 use bismuth::security::{self, DomainId, DomainSpec, Rights};
 use bismuth::{Stack, TaskId, Timeout, UserStack2K, kprintln, task, user};
+
+#[cfg(feature = "linux-demo")]
+mod linux_elf;
 
 /// The one place hardware addresses are asserted. QEMU `virt`: PL011 UART0 at 0x0900_0000,
 /// routed to GIC SPI 1 (interrupt 32 + 1).
@@ -364,16 +370,63 @@ pub extern "C" fn kernel_main() -> ! {
         bismuth::start(0);
     }
 
+    // The Linux-ABI demo loads and runs a real aarch64 Linux ELF at EL0 (`--features linux-demo`).
+    #[cfg(all(not(feature = "net-demo"), feature = "linux-demo"))]
+    {
+        linux_demo();
+        bismuth::start(0)
+    }
+
     // Interactive build hosts a real container + shell; otherwise the EL0 isolation demo.
-    #[cfg(all(not(feature = "net-demo"), feature = "interactive"))]
+    #[cfg(all(not(feature = "net-demo"), not(feature = "linux-demo"), feature = "interactive"))]
     {
         container_host();
         bismuth::start(0)
     }
-    #[cfg(all(not(feature = "net-demo"), not(feature = "interactive")))]
+    #[cfg(all(not(feature = "net-demo"), not(feature = "linux-demo"), not(feature = "interactive")))]
     {
         el0_demo();
         bismuth::start(0)
+    }
+}
+
+/// The Linux-ABI demo: load a hand-assembled aarch64 Linux ELF — `write(1, "Hello…", N); exit(0)`
+/// — into an EL0-exec buffer and run it as a sandboxed task. Its `svc #0` with Linux numbers in
+/// `x8` routes through the `linux-abi` personality: `write` reaches the console, `exit` retires
+/// the task. A watchdog then exits QEMU so the run terminates cleanly.
+#[cfg(all(not(feature = "net-demo"), feature = "linux-demo"))]
+fn linux_demo() {
+    kprintln!("Bismuth {} on QEMU virt — Linux-ABI demo (EL0 Linux ELF)", env!("CARGO_PKG_VERSION"));
+    let dom = security::create_domain(DomainSpec::sandboxed("linux", 4, 1)).unwrap();
+    security::seal().unwrap();
+    match bismuth::compat::linux::load::load_and_run(&linux_elf::HELLO_ELF, "hello", 2, dom) {
+        Ok(tid) => {
+            kprintln!("[linux] loaded hello ELF; entering EL0 at its _start");
+            APP_TASK.store(tid.as_raw(), Ordering::Relaxed);
+        }
+        Err(e) => {
+            kprintln!("[linux] load failed: {e:?}");
+            bismuth::arch::aarch64::qemu_exit(1);
+        }
+    }
+    task::spawn("done", 1, &SD, linux_finisher, 0).unwrap();
+}
+
+/// Await the Linux task's `exit` and report the demo result.
+#[cfg(all(not(feature = "net-demo"), feature = "linux-demo"))]
+fn linux_finisher(_: usize) {
+    let tid = TaskId::from_raw(APP_TASK.load(Ordering::Relaxed));
+    kprintln!("[done] waiting for the Linux task to exit...");
+    let r = task::join(tid, Timeout::ms(5000));
+    match r {
+        Ok(_) => {
+            kprintln!("aarch64 Linux-ABI demo complete: the EL0 Linux ELF ran, wrote via the Linux write syscall, and exited. PASS");
+            bismuth::arch::aarch64::qemu_exit(0);
+        }
+        Err(e) => {
+            kprintln!("aarch64 Linux-ABI demo FAILED (join={e:?})");
+            bismuth::arch::aarch64::qemu_exit(1);
+        }
     }
 }
 

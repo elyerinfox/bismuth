@@ -24,6 +24,10 @@ interactive = []
 # When set, the board runs the networking demo (virtio-net + IPv4/UDP over SLIRP) instead of
 # the EL0 isolation demo. Build/run with `cargo run --features net-demo` plus a `-netdev`.
 net-demo = []
+# When set, the board loads and runs a (hand-assembled) Linux aarch64 ELF at EL0 through the
+# `linux-abi` personality — it prints via the Linux `write` syscall and exits via `exit`.
+# Build/run with `cargo run --features linux-demo`.
+linux-demo = ["bismuth-kernel/linux-abi"]
 
 [profile.dev]
 panic = "abort"

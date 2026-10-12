@@ -137,6 +137,16 @@ pub fn supports_user_tasks() -> bool {
     paging::ready()
 }
 
+/// Open a loaded Linux image's EL0 pages: its code region read-execute and its stack region
+/// read-write (both inside the kernel-image GiB buffer the `compat::linux` loader prepared).
+/// Returns whether every page was opened (fails closed otherwise).
+#[cfg(feature = "linux-abi")]
+pub fn open_linux_image(code: (u64, u64), stack: (u64, u64)) -> bool {
+    let a = paging::open_user_exec(code.0, code.1);
+    let b = paging::open_user_range(stack.0, stack.1);
+    a && b
+}
+
 /// Whether an unprivileged task may have the kernel read `[addr, end)` as read-only data:
 /// the kernel's EL0-readable, non-writable pages (text + rodata).
 pub(crate) fn user_readable(addr: usize, end: usize) -> bool {

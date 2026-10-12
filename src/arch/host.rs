@@ -338,6 +338,13 @@ pub fn supports_user_tasks() -> bool {
     true
 }
 
+/// Opening a loaded Linux image's EL0 pages is a no-op on the host simulator (isolation is
+/// enforced in the kernel, not by a page table); the loader's copy/stack logic is still exercised.
+#[cfg(feature = "linux-abi")]
+pub fn open_linux_image(_code: (u64, u64), _stack: (u64, u64)) -> bool {
+    true
+}
+
 pub(crate) fn syscall(n: u32, args: [usize; 4]) -> isize {
     crate::security::syscall::dispatch(n, args)
 }

@@ -56,6 +56,10 @@ pub struct Builder {
     daemon: bool,
     domain: Option<DomainId>,
     kernel_service: bool,
+    /// A loaded Linux executable's `(entry, sp_el0)` — both addresses inside the EL0-exec image
+    /// buffer the `compat::linux` loader prepared. Set via [`Builder::spawn_linux`].
+    #[cfg(feature = "linux-abi")]
+    linux: Option<(usize, usize)>,
 }
 
 impl Builder {
@@ -69,6 +73,8 @@ impl Builder {
             daemon: false,
             domain: None,
             kernel_service: false,
+            #[cfg(feature = "linux-abi")]
+            linux: None,
         }
     }
 
@@ -143,6 +149,20 @@ impl Builder {
         self.spawn_impl(idle_main, Some(entry), arg)
     }
 
+    /// Spawn a **loaded Linux executable** as a hardware-isolated EL0 task (`linux-abi`): it
+    /// enters at `entry` with `sp_el0` as its stack pointer (both addresses in the EL0-exec image
+    /// buffer the loader prepared), its `svc` traps route to the Linux ABI, and its reads/writes
+    /// are confined to the EL0 pages the loader opened. The pool stack claimed here is only the
+    /// kernel-stack anchor and the slot's nominal user stack; the task runs on `sp_el0`.
+    #[cfg(feature = "linux-abi")]
+    pub fn spawn_linux(mut self, entry: usize, sp_el0: usize) -> Result<TaskId, Error> {
+        if !port::supports_user_tasks() {
+            return Err(Error::Unsupported);
+        }
+        self.linux = Some((entry, sp_el0));
+        self.spawn_impl(idle_main, Some(linux_entry_stub), 0)
+    }
+
     fn spawn_impl(mut self, entry: fn(usize), user: Option<extern "C-unwind" fn(usize)>, arg: usize) -> Result<TaskId, Error> {
         if !(MIN_PRIORITY..=MAX_PRIORITY).contains(&self.priority) {
             return Err(Error::Invalid);
@@ -196,6 +216,12 @@ impl Builder {
                 t.user_entry = user;
                 t.kstack = kstack;
                 t.domain = target.0;
+                #[cfg(feature = "linux-abi")]
+                if let Some((lentry, lsp)) = self.linux {
+                    t.is_linux = true;
+                    t.linux_entry = lentry;
+                    t.linux_sp = lsp;
+                }
             }
             k.install_task_user(i, self.name, self.priority, stack, entry, arg, target.0);
             let t = &mut k.tasks[i as usize];
@@ -551,6 +577,12 @@ static IDLE_HOOK: super::cell::IrqCell<Option<fn()>> = super::cell::IrqCell::new
 pub fn set_idle_hook(f: fn()) {
     IDLE_HOOK.lock(|h| *h = Some(f));
 }
+
+/// Placeholder user entry for a loaded Linux task: the arch port overrides `ELR_EL1` with the
+/// ELF entry in [`port::init_task`], so this is never executed. It exists only so the task takes
+/// the EL0 (unprivileged) spawn path.
+#[cfg(feature = "linux-abi")]
+extern "C-unwind" fn linux_entry_stub(_: usize) {}
 
 pub(crate) fn idle_main(_: usize) {
     loop {

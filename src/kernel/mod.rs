@@ -152,6 +152,14 @@ pub(crate) struct Tcb {
     #[cfg(feature = "linux-abi")]
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub is_linux: bool,
+    /// A loaded Linux task's raw entry address (an offset into the EL0-exec image buffer).
+    #[cfg(feature = "linux-abi")]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub linux_entry: usize,
+    /// A loaded Linux task's initial `SP_EL0` (top of its built SysV stack in the EL0 buffer).
+    #[cfg(feature = "linux-abi")]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub linux_sp: usize,
 }
 
 impl Tcb {
@@ -190,6 +198,10 @@ impl Tcb {
         tls: [0; 4],
         #[cfg(feature = "linux-abi")]
         is_linux: false,
+        #[cfg(feature = "linux-abi")]
+        linux_entry: 0,
+        #[cfg(feature = "linux-abi")]
+        linux_sp: 0,
     };
 }
 
@@ -436,7 +448,11 @@ impl Kernel {
         domain: u8,
     ) {
         let t = &self.tasks[i as usize];
-        let (user, user_entry, kstack) = (t.user, t.user_entry, self.tasks[i as usize].kstack.take());
+        let (user, user_entry) = (t.user, t.user_entry);
+        // A loaded Linux task carries its raw entry/stack across the slot reset (set before install).
+        #[cfg(feature = "linux-abi")]
+        let (is_linux, linux_entry, linux_sp) = (t.is_linux, t.linux_entry, t.linux_sp);
+        let kstack = self.tasks[i as usize].kstack.take();
         let generation = self.tasks[i as usize].generation.wrapping_add(1);
         stack.paint();
         self.tasks[i as usize] = Tcb {
@@ -452,6 +468,12 @@ impl Kernel {
             user,
             user_entry,
             kstack,
+            #[cfg(feature = "linux-abi")]
+            is_linux,
+            #[cfg(feature = "linux-abi")]
+            linux_entry,
+            #[cfg(feature = "linux-abi")]
+            linux_sp,
             ..Tcb::EMPTY
         };
         port::init_task(self, i);
