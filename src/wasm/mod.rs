@@ -11,6 +11,8 @@
 //! Classification: L4 personalities · wasm interpreter · safe · wasm
 #![cfg(feature = "heap")]
 
+pub mod oci;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 
