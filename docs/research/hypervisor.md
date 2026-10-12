@@ -132,18 +132,38 @@ interrupt injection. Guest EL0<->EL1 syscalls run natively and never trap to EL2
     — returning the result in `x0` and skipping the `smc`. The capstone guest now powers the VM off
     with a real `SYSTEM_OFF` SMC instead of an exit hypercall. QEMU-verified: banner, five
     hardware-timer ticks via the vGIC, PSCI power-off.
+- **S7 — virtio-blk + virtio-net backends (DONE).** The S4 single-device console emulator is
+  generalized to a small array of virtio-mmio devices at distinct IPA slots (console `0x0a00_0000`,
+  block `0x0a00_0200`, net `0x0a00_0400`); the stage-2 abort handler picks the device by IPA and
+  routes the decoded access to a shared register-file emulator.
+  - *virtio-blk (DeviceID 2):* a host RAM disk (128 × 512-byte sectors, seeded). On `QueueNotify`
+    the backend parses the request chain (16-byte header → data buffer(s) → 1-byte status) and
+    serves `VIRTIO_BLK_T_IN`/`T_OUT` against the disk via `gpa_to_hpa`, writing the status and
+    publishing the used ring.
+  - *virtio-net (DeviceID 1):* RX(0)/TX(1) queues with a loopback backend — on a TX kick it reads
+    the guest's frame, prints a summary, and copies it into a buffer the guest pre-posted on the RX
+    queue, publishing both used rings (bidirectional path).
+  - The S7 guest "OS" runs the console banner, then reads sector 0 of the block device and prints
+    it, then transmits a frame and confirms the RX loopback, then takes the five hardware-timer
+    ticks and powers off via PSCI. QEMU-verified end to end. Scope: polled (the guest reads the used
+    ring; no used-buffer vIRQ yet), small queues, loopback net (no real link). These are the same
+    device classes a Linux guest drives — the backing (a Bismuth VFS file as rootfs, the in-tree NIC
+    as the link) is the remaining substitution, not new mechanism.
 
 ## What the hypervisor can do today
 
 A `--features hypervisor` Bismuth boot (QEMU `-M virt,virtualization=on`) is a working minimal
 type-1 hypervisor: it runs at **EL2**, creates a guest VM with its own **stage-2-translated RAM**
 (guest accesses outside it fault to EL2), a **vGIC** that injects virtual interrupts the guest
-acks/EOIs through its own GICV, an emulated **virtio-mmio console** driven by the standard guest
-virtio handshake + virtqueue (trap-and-emulate), a **free-running hardware-timer tick** (the EL2
-physical timer injecting the guest's virtual-timer IRQ on its own cadence), **PSCI-over-SMC** power
-control (`VERSION`/`SYSTEM_OFF`/`RESET`/`FEATURES`/`CPU_ON`), and a small **hypercall ABI**. The
-capstone guest "OS" uses all of these together and powers itself off via PSCI. What a real Linux
-guest additionally needs is enumerated next.
+acks/EOIs through its own GICV, emulated **virtio-mmio devices** driven by the standard guest
+virtio handshake + virtqueues (trap-and-emulate) — a **console** (drains to the UART), a **block**
+device (host RAM disk, read/write requests), and a **network** device (TX/RX loopback) — a
+**free-running hardware-timer tick** (the EL2 physical timer injecting the guest's virtual-timer
+IRQ on its own cadence), **PSCI-over-SMC** power control
+(`VERSION`/`SYSTEM_OFF`/`RESET`/`FEATURES`/`CPU_ON`), and a small **hypercall ABI**. The capstone
+guest "OS" uses all of these together — prints a banner, reads a disk sector, round-trips a network
+frame, takes timer ticks, and powers itself off via PSCI. What a real Linux guest additionally
+needs (a kernel image, a fuller GICD, larger device backing) is enumerated next.
 
 ## The honest blocker for *literal* Linux/Docker
 
@@ -170,9 +190,10 @@ hypervisor-side work on top of S1–S5 is:
   injection/LR-refill mechanism is the same one proven here.)
 - **vGIC distributor:** present a fuller **GICD** (trap-and-emulate `ISENABLER`/`IPRIORITYR`/etc., or
   GICv3 `GICR`) — Linux configures the distributor, not just the CPU interface.
-- **virtio-blk / virtio-net backends:** extend the S4 virtio-mmio emulator with block (serve a
-  Bismuth VFS file / RAM disk as the rootfs) and net (bridge to the in-tree NIC), plus used-buffer
-  vIRQ injection, so the guest has a root filesystem and I/O.
+- **virtio-blk / virtio-net backends:** ✅ DONE (S7) — the virtio-mmio emulator now presents a
+  block device (host RAM disk) and a net device (loopback) alongside the console, driven by the
+  standard guest handshake + virtqueues. For a real guest: back blk with a Bismuth VFS file / larger
+  disk as the rootfs, bridge net to the in-tree NIC, and add used-buffer vIRQ injection (poll → IRQ).
 - **Console:** the S4 virtio-console already serves guest output; add RX for input.
 
 None of these are blocked *in principle* — they are more of the same trap-and-emulate the S1–S5

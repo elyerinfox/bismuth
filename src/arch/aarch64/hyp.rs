@@ -261,37 +261,84 @@ fn inject(vintid: u64) {
     write32(GICH + GICH_LR0, (1 << 30) | (1 << 28) | (vintid as u32 & 0x3FF));
 }
 
-// ---- Stage 4: an emulated virtio-mmio console (MMIO trap-and-emulate) ----
+// ---- Stages 4/7: emulated virtio-mmio devices (MMIO trap-and-emulate) ----
 //
-// The guest sees a standard virtio-mmio device at IPA `VIRTIO_MMIO_BASE` (the QEMU `virt` virtio
-// slot). That window is deliberately left UNMAPPED in stage-2, so every guest load/store there
-// faults to EL2; the abort handler decodes the access from `ESR_EL2` (ISV/SAS/SRT/WnR) and routes
-// it to this register-file emulator, then advances the guest past the instruction. When the guest
-// kicks the queue (`QueueNotify`), the backend walks the split virtqueue *in guest RAM* (via
-// [`gpa_to_hpa`]) and drains the buffers to the real UART — paravirtual console output the way a
-// real guest driver does it, with no Bismuth-specific hypercall.
+// The guest sees standard virtio-mmio devices at three IPA slots inside the QEMU `virt` virtio
+// window: a **console** (DeviceID 3) at `VIRTIO_BASE`, a **block** device (DeviceID 2) one stride
+// up, and a **network** device (DeviceID 1) another stride up. The whole window is left UNMAPPED
+// in stage-2, so every guest load/store there faults to EL2; the abort handler decodes the access
+// from `ESR_EL2` (ISV/SAS/SRT/WnR), picks the device by IPA, and routes it to this register-file
+// emulator, then advances the guest past the instruction. When the guest kicks a queue
+// (`QueueNotify`), the backend walks the split virtqueue *in guest RAM* (via [`gpa_to_hpa`]):
+// the console drains buffers to the real UART; the block device services read/write requests
+// against a host RAM disk; the network device prints the transmitted frame and loops it back into
+// the guest's receive queue — all paravirtual I/O the way a real guest driver does it.
 //
-// Scope note (see docs/research/hypervisor.md): one queue, modern-mmio register layout but a
-// legacy-style zero-feature handshake, polled (no used-buffer IRQ injected), single-shot drain.
-const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
-const VIRTIO_MMIO_SIZE: u64 = 0x200;
-const VIRTIO_MAGIC: u32 = 0x7472_6976; // "virt"
-const VIRTIO_CONSOLE_ID: u32 = 3;
+// Scope note (see docs/research/hypervisor.md): modern-mmio register layout with a legacy-style
+// zero-feature handshake, polled (no used-buffer IRQ injected — the guest polls the used ring),
+// small queues, one RAM disk, net loopback. Enough for a guest OS to read a disk + round-trip a
+// frame; a real rootfs/NIC is the same machinery against larger backing.
 
-/// The emulated device's register state (single queue). EL2 runs MMU-off and single-threaded, so a
-/// plain `static mut` is sound here (no atomics).
-struct VirtioConsole {
-    status: u32,
-    queue_sel: u32,
-    queue_num: u32,
-    queue_ready: u32,
+const VIRTIO_BASE: u64 = 0x0a00_0000;
+const VIRTIO_STRIDE: u64 = 0x200; // per-device MMIO window
+const VIRTIO_NDEV: usize = 3;
+const VIRTIO_WIN_SIZE: u64 = VIRTIO_STRIDE * VIRTIO_NDEV as u64; // 0x600
+
+const DEV_CONSOLE: usize = 0;
+const DEV_BLK: usize = 1;
+const DEV_NET: usize = 2;
+// DeviceID per slot: console=3, block=2, network=1.
+const DEV_IDS: [u32; VIRTIO_NDEV] = [3, 2, 1];
+const VIRTIO_MAGIC: u32 = 0x7472_6976; // "virt"
+
+// virtqueue descriptor flags.
+const VIRTQ_DESC_F_NEXT: u16 = 0x1;
+
+/// One split virtqueue's guest-physical ring addresses + the backend's consumer index.
+#[derive(Copy, Clone)]
+struct Vq {
     desc: u64,
     avail: u64,
     used: u64,
     used_idx: u16,
 }
-static mut VIRTIO: VirtioConsole =
-    VirtioConsole { status: 0, queue_sel: 0, queue_num: 0, queue_ready: 0, desc: 0, avail: 0, used: 0, used_idx: 0 };
+impl Vq {
+    const NEW: Vq = Vq { desc: 0, avail: 0, used: 0, used_idx: 0 };
+}
+
+/// An emulated virtio-mmio device: its negotiated status, the selected queue, and up to two
+/// queues (net uses RX=0/TX=1; console/blk use queue 0). EL2 is single-threaded + MMU-off, so
+/// plain `static mut` is sound (no atomics).
+#[derive(Copy, Clone)]
+struct Vdev {
+    status: u32,
+    qsel: u32,
+    qready: u32,
+    q: [Vq; 2],
+}
+impl Vdev {
+    const NEW: Vdev = Vdev { status: 0, qsel: 0, qready: 0, q: [Vq::NEW, Vq::NEW] };
+}
+static mut VDEVS: [Vdev; VIRTIO_NDEV] = [Vdev::NEW; VIRTIO_NDEV];
+
+// A host-backed RAM disk for the block device: 128 × 512-byte sectors, seeded in `seed_blk`.
+const BLK_SECTORS: usize = 128;
+const BLK_BYTES: usize = BLK_SECTORS * 512;
+#[repr(C, align(8))]
+struct BlkDisk([u8; BLK_BYTES]);
+static mut BLK_DISK: BlkDisk = BlkDisk([0; BLK_BYTES]);
+
+/// Seed sector 0 of the RAM disk with recognizable content the guest reads back.
+fn seed_blk() {
+    let msg = b"BISMUTH virtio-blk RAM disk, sector 0: hello from the host backend!";
+    // SAFETY: single-threaded EL2 bring-up; the disk is ours alone.
+    unsafe {
+        let d = addr_of_mut!(BLK_DISK) as *mut u8;
+        for (i, &b) in msg.iter().enumerate() {
+            d.add(i).write_volatile(b);
+        }
+    }
+}
 
 // Small physical-memory accessors (EL2 MMU-off ⇒ host-physical == VA). Used to walk guest RAM.
 fn rd_u8(a: u64) -> u8 {
@@ -307,104 +354,266 @@ fn rd_u32(a: u64) -> u32 {
 fn rd_u64(a: u64) -> u64 {
     (rd_u32(a) as u64) | ((rd_u32(a + 4) as u64) << 32)
 }
+fn wr_u8(a: u64, v: u8) {
+    // SAFETY: `a` is inside the guest RAM arena / RAM disk (bounds-checked by caller).
+    unsafe { core::ptr::write_volatile(a as *mut u8, v) }
+}
 fn wr_u16(a: u64, v: u16) {
-    // SAFETY: `a` is inside the guest RAM arena (bounds-checked by caller).
-    unsafe {
-        core::ptr::write_volatile(a as *mut u8, v as u8);
-        core::ptr::write_volatile((a + 1) as *mut u8, (v >> 8) as u8);
-    }
+    wr_u8(a, v as u8);
+    wr_u8(a + 1, (v >> 8) as u8);
 }
 fn wr_u32(a: u64, v: u32) {
     wr_u16(a, v as u16);
     wr_u16(a + 2, (v >> 16) as u16);
 }
 
-/// Emulate a guest read of the virtio-mmio register at `off`.
-fn virtio_read(off: usize) -> u32 {
+/// Read the disk byte at linear offset `off` (bounds-checked).
+fn blk_rd(off: usize) -> u8 {
+    if off < BLK_BYTES {
+        // SAFETY: bounds-checked index into our RAM disk.
+        unsafe { (addr_of_mut!(BLK_DISK) as *const u8).add(off).read_volatile() }
+    } else {
+        0
+    }
+}
+/// Write the disk byte at linear offset `off` (bounds-checked).
+fn blk_wr(off: usize, v: u8) {
+    if off < BLK_BYTES {
+        // SAFETY: bounds-checked index into our RAM disk.
+        unsafe { (addr_of_mut!(BLK_DISK) as *mut u8).add(off).write_volatile(v) }
+    }
+}
+
+/// Whether `[ipa, ipa+len)` lies within the guest RAM window.
+fn in_guest(ipa: u64, len: u64) -> bool {
+    ipa >= GUEST_IPA_BASE && ipa.checked_add(len).map(|e| e <= GUEST_IPA_BASE + GUEST_RAM_SIZE).unwrap_or(false)
+}
+
+/// Emulate a guest read of device `dev`'s virtio-mmio register at `off`.
+fn virtio_read(dev: usize, off: usize) -> u32 {
     // SAFETY: single-threaded EL2 access to our own device state.
-    let v = unsafe { &*addr_of_mut!(VIRTIO) };
+    let v = unsafe { &*addr_of_mut!(VDEVS) };
+    let d = &v[dev];
     match off {
         0x000 => VIRTIO_MAGIC,
-        0x004 => 2,                 // Version (modern mmio)
-        0x008 => VIRTIO_CONSOLE_ID, // DeviceID = console
-        0x00c => 0x554d_4551,       // VendorID "QEMU"
-        0x010 => 0,                 // DeviceFeatures (expose none — legacy-style handshake)
-        0x034 => 8,                 // QueueNumMax
-        0x044 => v.queue_ready,
-        0x060 => 0,                 // InterruptStatus
-        0x070 => v.status,
-        0x0fc => 0,                 // ConfigGeneration
+        0x004 => 2,              // Version (modern mmio)
+        0x008 => DEV_IDS[dev],   // DeviceID
+        0x00c => 0x554d_4551,    // VendorID "QEMU"
+        0x010 => 0,              // DeviceFeatures (expose none — legacy-style handshake)
+        0x034 => 8,              // QueueNumMax
+        0x044 => d.qready,
+        0x060 => 0,              // InterruptStatus (polled; no IRQ)
+        0x070 => d.status,
+        0x0fc => 0,              // ConfigGeneration
+        // Device-specific config space (0x100+):
+        0x100 if dev == DEV_BLK => BLK_SECTORS as u32, // blk capacity (sectors), low word
+        0x104 if dev == DEV_BLK => 0,                  // capacity high word
+        0x100 if dev == DEV_NET => 0x1200_5452,        // net MAC[0..4] = 52:54:00:12
+        0x104 if dev == DEV_NET => 0x0000_5634,        // net MAC[4..6] = 34:56
         _ => 0,
     }
 }
 
-/// Emulate a guest write of `val` to the virtio-mmio register at `off`; on `QueueNotify`, drain.
-fn virtio_write(off: usize, val: u32) {
+/// Emulate a guest write of `val` to device `dev`'s virtio-mmio register at `off`.
+fn virtio_write(dev: usize, off: usize, val: u32) {
     // SAFETY: single-threaded EL2 access to our own device state.
-    let v = unsafe { &mut *addr_of_mut!(VIRTIO) };
+    let v = unsafe { &mut *addr_of_mut!(VDEVS) };
+    let d = &mut v[dev];
+    let qi = (d.qsel & 1) as usize;
     match off {
-        0x030 => v.queue_sel = val,
-        0x038 => v.queue_num = val,
-        0x044 => v.queue_ready = val,
-        0x050 => virtio_notify(), // QueueNotify: the guest kicked the queue
-        0x070 => v.status = val,  // 0 = device reset
-        0x080 => v.desc = (v.desc & 0xffff_ffff_0000_0000) | val as u64,
-        0x084 => v.desc = (v.desc & 0xffff_ffff) | ((val as u64) << 32),
-        0x090 => v.avail = (v.avail & 0xffff_ffff_0000_0000) | val as u64,
-        0x094 => v.avail = (v.avail & 0xffff_ffff) | ((val as u64) << 32),
-        0x0a0 => v.used = (v.used & 0xffff_ffff_0000_0000) | val as u64,
-        0x0a4 => v.used = (v.used & 0xffff_ffff) | ((val as u64) << 32),
-        _ => {} // DeviceFeaturesSel/DriverFeatures(Sel)/InterruptACK: accepted, no state needed
+        0x030 => d.qsel = val,
+        0x038 => {} // QueueNum (we use a fixed ring size)
+        0x044 => d.qready = val,
+        0x050 => notify(dev, val), // QueueNotify: `val` = the queue index the guest kicked
+        0x070 => d.status = val,   // 0 = device reset
+        0x080 => d.q[qi].desc = (d.q[qi].desc & 0xffff_ffff_0000_0000) | val as u64,
+        0x084 => d.q[qi].desc = (d.q[qi].desc & 0xffff_ffff) | ((val as u64) << 32),
+        0x090 => d.q[qi].avail = (d.q[qi].avail & 0xffff_ffff_0000_0000) | val as u64,
+        0x094 => d.q[qi].avail = (d.q[qi].avail & 0xffff_ffff) | ((val as u64) << 32),
+        0x0a0 => d.q[qi].used = (d.q[qi].used & 0xffff_ffff_0000_0000) | val as u64,
+        0x0a4 => d.q[qi].used = (d.q[qi].used & 0xffff_ffff) | ((val as u64) << 32),
+        _ => {} // feature-sel / driver-features / InterruptACK: accepted, no state needed
     }
 }
 
-/// Walk the split virtqueue in guest RAM and drain each newly-available buffer to the UART,
-/// marking it used. Descriptor/ring addresses are guest IPAs translated through stage-2.
-fn virtio_notify() {
+/// Route a `QueueNotify` to the right device backend.
+fn notify(dev: usize, qidx: u32) {
+    match dev {
+        DEV_CONSOLE => console_drain(),
+        DEV_BLK => blk_service(),
+        DEV_NET => net_service(qidx),
+        _ => {}
+    }
+}
+
+const QSIZE: u16 = 8;
+
+/// Console backend: drain each newly-available buffer of queue 0 to the UART.
+fn console_drain() {
     // SAFETY: single-threaded EL2 access to our own device state.
-    let v = unsafe { &mut *addr_of_mut!(VIRTIO) };
-    let qsize = if v.queue_num == 0 { 8 } else { v.queue_num as u16 };
-    let (Some(desc), Some(avail), Some(used)) =
-        (gpa_to_hpa(v.desc), gpa_to_hpa(v.avail), gpa_to_hpa(v.used))
-    else {
-        puts(b"[hyp] virtio: queue addresses outside guest RAM\n");
+    let d = unsafe { &mut (*addr_of_mut!(VDEVS))[DEV_CONSOLE] };
+    let q = &mut d.q[0];
+    let (Some(_desc), Some(avail), Some(used)) = (gpa_to_hpa(q.desc), gpa_to_hpa(q.avail), gpa_to_hpa(q.used)) else {
+        puts(b"[hyp] virtio-console: ring outside guest RAM\n");
         return;
     };
-    let avail_idx = rd_u16(avail + 2); // avail.idx
-    while v.used_idx != avail_idx {
-        let slot = (v.used_idx % qsize) as u64;
-        let head = rd_u16(avail + 4 + slot * 2); // desc index for this request
-        // Follow the descriptor chain, draining each buffer to the UART.
+    let avail_idx = rd_u16(avail + 2);
+    while q.used_idx != avail_idx {
+        let slot = (q.used_idx % QSIZE) as u64;
+        let head = rd_u16(avail + 4 + slot * 2);
         let mut di = head;
         let mut total = 0u32;
         loop {
-            let Some(d) = gpa_to_hpa(v.desc.wrapping_add(di as u64 * 16)) else { break };
-            let _ = desc;
-            let buf_ipa = rd_u64(d);
-            let len = rd_u32(d + 8);
-            let flags = rd_u16(d + 12);
-            let next = rd_u16(d + 14);
+            let Some(dp) = gpa_to_hpa(q.desc.wrapping_add(di as u64 * 16)) else { break };
+            let buf_ipa = rd_u64(dp);
+            let len = rd_u32(dp + 8);
+            let flags = rd_u16(dp + 12);
+            let next = rd_u16(dp + 14);
             if let Some(buf) = gpa_to_hpa(buf_ipa) {
-                if buf_ipa + len as u64 <= GUEST_IPA_BASE + GUEST_RAM_SIZE {
+                if in_guest(buf_ipa, len as u64) {
                     for i in 0..len as u64 {
                         put(rd_u8(buf + i));
                     }
                     total += len;
                 }
             }
-            if flags & 0x1 != 0 {
-                di = next; // VIRTQ_DESC_F_NEXT
+            if flags & VIRTQ_DESC_F_NEXT != 0 {
+                di = next;
             } else {
                 break;
             }
         }
-        // Publish the completion in the used ring.
-        let uslot = (v.used_idx % qsize) as u64;
-        wr_u32(used + 4 + uslot * 8, head as u32); // used.ring[].id
-        wr_u32(used + 8 + uslot * 8, total); // used.ring[].len
-        v.used_idx = v.used_idx.wrapping_add(1);
-        wr_u16(used + 2, v.used_idx); // used.idx
+        let uslot = (q.used_idx % QSIZE) as u64;
+        wr_u32(used + 4 + uslot * 8, head as u32);
+        wr_u32(used + 8 + uslot * 8, total);
+        q.used_idx = q.used_idx.wrapping_add(1);
+        wr_u16(used + 2, q.used_idx);
     }
+}
+
+/// Block backend: service virtio-blk requests on queue 0 against the host RAM disk. Each request
+/// is a descriptor chain: a 16-byte header (type + sector), one or more data buffers, and a 1-byte
+/// status. `VIRTIO_BLK_T_IN` (0) reads the disk into the guest; `T_OUT` (1) writes it.
+fn blk_service() {
+    // SAFETY: single-threaded EL2 access to our own device state.
+    let d = unsafe { &mut (*addr_of_mut!(VDEVS))[DEV_BLK] };
+    let q = &mut d.q[0];
+    let (Some(_desc), Some(avail), Some(used)) = (gpa_to_hpa(q.desc), gpa_to_hpa(q.avail), gpa_to_hpa(q.used)) else {
+        puts(b"[hyp] virtio-blk: ring outside guest RAM\n");
+        return;
+    };
+    let avail_idx = rd_u16(avail + 2);
+    while q.used_idx != avail_idx {
+        let slot = (q.used_idx % QSIZE) as u64;
+        let head = rd_u16(avail + 4 + slot * 2);
+        // Descriptor 0: the request header (device reads it).
+        let Some(d0) = gpa_to_hpa(q.desc + head as u64 * 16) else { break };
+        let hdr_ipa = rd_u64(d0);
+        let Some(hdr) = gpa_to_hpa(hdr_ipa) else { break };
+        let rtype = rd_u32(hdr); // 0 = IN (read), 1 = OUT (write)
+        let sector = rd_u64(hdr + 8);
+        let mut written = 0u32;
+        // Walk the rest of the chain: data buffer(s) then the status byte.
+        let mut flags = rd_u16(d0 + 12);
+        let mut di = rd_u16(d0 + 14);
+        let mut off = (sector as usize).wrapping_mul(512);
+        while flags & VIRTQ_DESC_F_NEXT != 0 {
+            let Some(dp) = gpa_to_hpa(q.desc + di as u64 * 16) else { break };
+            let buf_ipa = rd_u64(dp);
+            let len = rd_u32(dp + 8);
+            let dflags = rd_u16(dp + 12);
+            let nxt = rd_u16(dp + 14);
+            let is_status = (dflags & VIRTQ_DESC_F_NEXT == 0) && len == 1;
+            if let Some(buf) = gpa_to_hpa(buf_ipa) {
+                if in_guest(buf_ipa, len as u64) {
+                    if is_status {
+                        wr_u8(buf, 0); // VIRTIO_BLK_S_OK
+                    } else if rtype == 0 {
+                        for i in 0..len as usize {
+                            wr_u8(buf + i as u64, blk_rd(off + i));
+                        }
+                        off += len as usize;
+                        written += len;
+                    } else {
+                        for i in 0..len as usize {
+                            blk_wr(off + i, rd_u8(buf + i as u64));
+                        }
+                        off += len as usize;
+                    }
+                }
+            }
+            flags = dflags;
+            di = nxt;
+        }
+        wr_u32(used + 4 + slot * 8, head as u32);
+        wr_u32(used + 8 + slot * 8, written + 1);
+        q.used_idx = q.used_idx.wrapping_add(1);
+        wr_u16(used + 2, q.used_idx);
+    }
+}
+
+/// Network backend (loopback): on a TX-queue (1) notify, read each transmitted frame, print a
+/// summary, and copy it into a buffer the guest pre-posted on the RX queue (0) — so the guest
+/// receives its own frame back, proving a bidirectional virtio-net path.
+fn net_service(qidx: u32) {
+    if qidx != 1 {
+        return; // only the TX kick drives work; RX buffers are consumed here
+    }
+    // SAFETY: single-threaded EL2 access to our own device state.
+    let d = unsafe { &mut (*addr_of_mut!(VDEVS))[DEV_NET] };
+    let tx = d.q[1];
+    let rx = d.q[0];
+    let (Some(_td), Some(tavail), Some(tused)) = (gpa_to_hpa(tx.desc), gpa_to_hpa(tx.avail), gpa_to_hpa(tx.used)) else {
+        puts(b"[hyp] virtio-net: TX ring outside guest RAM\n");
+        return;
+    };
+    let tx_avail_idx = rd_u16(tavail + 2);
+    let mut tused_idx = tx.used_idx;
+    let mut rused_idx = rx.used_idx;
+    while tused_idx != tx_avail_idx {
+        let slot = (tused_idx % QSIZE) as u64;
+        let head = rd_u16(tavail + 4 + slot * 2);
+        let Some(dp) = gpa_to_hpa(tx.desc + head as u64 * 16) else { break };
+        let buf_ipa = rd_u64(dp);
+        let len = rd_u32(dp + 8);
+        puts(b"[hyp] virtio-net: guest TX frame, ");
+        put_dec(len as u64);
+        puts(b" bytes -- looping back to RX\n");
+        // Loop the frame into the guest's pre-posted RX buffer (queue 0), if one is available.
+        if let (Some(ravail), Some(rused), Some(src)) = (gpa_to_hpa(rx.avail), gpa_to_hpa(rx.used), gpa_to_hpa(buf_ipa)) {
+            let rx_avail_idx = rd_u16(ravail + 2);
+            if rused_idx != rx_avail_idx && in_guest(buf_ipa, len as u64) {
+                let rslot = (rused_idx % QSIZE) as u64;
+                let rhead = rd_u16(ravail + 4 + rslot * 2);
+                if let Some(rd0) = gpa_to_hpa(rx.desc + rhead as u64 * 16) {
+                    let rbuf_ipa = rd_u64(rd0);
+                    let rbuf_len = rd_u32(rd0 + 8);
+                    if let Some(rbuf) = gpa_to_hpa(rbuf_ipa) {
+                        if in_guest(rbuf_ipa, rbuf_len as u64) {
+                            let n = len.min(rbuf_len);
+                            for i in 0..n as u64 {
+                                wr_u8(rbuf + i, rd_u8(src + i));
+                            }
+                            wr_u32(rused + 4 + rslot * 8, rhead as u32);
+                            wr_u32(rused + 8 + rslot * 8, n);
+                            rused_idx = rused_idx.wrapping_add(1);
+                            wr_u16(rused + 2, rused_idx);
+                        }
+                    }
+                }
+            }
+        }
+        // Complete the TX descriptor.
+        wr_u32(tused + 4 + slot * 8, head as u32);
+        wr_u32(tused + 8 + slot * 8, 0);
+        tused_idx = tused_idx.wrapping_add(1);
+        wr_u16(tused + 2, tused_idx);
+    }
+    // Commit the consumer indices back to the device state.
+    // SAFETY: single-threaded EL2 access to our own device state.
+    let d = unsafe { &mut (*addr_of_mut!(VDEVS))[DEV_NET] };
+    d.q[1].used_idx = tused_idx;
+    d.q[0].used_idx = rused_idx;
 }
 
 /// Write one byte to the PL011, spinning while the TX FIFO is full.
@@ -635,20 +844,22 @@ extern "C" fn hvc_entry(frame: *mut u64) {
             let ipa = ((hpfar & 0xF_FFFF_FFF0) << 8) | (far & 0xFFF);
             // Stage 4: a data abort inside the emulated virtio-mmio window is not a violation —
             // trap-and-emulate the register access and resume the guest past the instruction.
-            if ec == 0x24 && (VIRTIO_MMIO_BASE..VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE).contains(&ipa) {
+            if ec == 0x24 && (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_WIN_SIZE).contains(&ipa) {
                 let iss = esr & 0x1FF_FFFF;
                 if (iss >> 24) & 1 == 1 {
                     // ISV=1: the syndrome describes the access. SRT=reg, WnR=direction.
                     let srt = ((iss >> 16) & 0x1f) as usize;
                     let wnr = (iss >> 6) & 1;
-                    let off = (ipa - VIRTIO_MMIO_BASE) as usize;
+                    // Pick the device by IPA slot, and the register offset within its window.
+                    let dev = ((ipa - VIRTIO_BASE) / VIRTIO_STRIDE) as usize;
+                    let off = ((ipa - VIRTIO_BASE) % VIRTIO_STRIDE) as usize;
                     if wnr == 1 {
                         // Store: the value is in the source register (x31 = XZR = 0).
                         let val = if srt == 31 { 0 } else { unsafe { *frame.add(srt) } } as u32;
-                        virtio_write(off, val);
+                        virtio_write(dev, off, val);
                     } else {
                         // Load: deliver the emulated register value into the destination register.
-                        let val = virtio_read(off);
+                        let val = virtio_read(dev, off);
                         if srt != 31 {
                             unsafe { *frame.add(srt) = val as u64 };
                         }
@@ -766,6 +977,9 @@ pub fn run_guest(blob: &[u8]) -> ! {
     }
     let entry = GUEST_IPA_BASE; // guest-physical (IPA) entry
     let gsp = (GUEST_IPA_BASE + GUEST_RAM_SIZE) & !0xf; // guest stack top (IPA)
+
+    // Seed the virtio-blk RAM disk the guest will read.
+    seed_blk();
 
     // Build and enable the guest's stage-2 address space before entering it.
     setup_stage2();
