@@ -20,7 +20,7 @@
 #![allow(unsafe_code)]
 
 use core::arch::{asm, naked_asm};
-use core::ptr::addr_of_mut;
+use core::ptr::{addr_of, addr_of_mut};
 
 /// QEMU `virt` PL011 UART0. Stage 1 targets QEMU `virt` only; stage 2+ takes this from the
 /// board map. The hypervisor owns the UART directly (the guest prints only via hypercalls).
@@ -261,6 +261,80 @@ fn inject(vintid: u64) {
     write32(GICH + GICH_LR0, (1 << 30) | (1 << 28) | (vintid as u32 & 0x3FF));
 }
 
+// ---- Stage 9: emulated GICv2 distributor (GICD) ----
+//
+// The guest's GIC *CPU interface* is the real GICV (stage-2-mapped at GUEST_GICC_IPA). Its
+// *distributor* (`/intc` reg[0] = 0x0800_0000) is left unmapped in stage-2 and trap-and-emulated
+// here, so the hypervisor — not the host's real distributor — owns the guest's interrupt enable /
+// priority / config state, the way a real aarch64 Linux kernel programs GICD at boot. We track the
+// enable mask and gate the virtual-timer injection on it: the guest receives timer ticks only once
+// it has enabled INTID 27 in GICD_ISENABLER (exactly as a real kernel must).
+const GICD_IPA: u64 = 0x0800_0000;
+const GICD_WIN: u64 = 0x1_0000; // 64 KiB distributor window
+/// Enable bitmap for INTIDs 0..63 (banked SGIs/PPIs 0..31 + SPIs 32..63) and the group config.
+static mut GICD_CTLR: u32 = 0;
+static mut GICD_ENABLE: [u32; 2] = [0; 2];
+static mut GICD_GROUP: [u32; 2] = [0; 2];
+
+/// Emulate a guest read of the distributor register at `off`.
+fn gicd_read(off: usize) -> u32 {
+    // SAFETY: single-threaded EL2 access to our own distributor state (raw-pointer reads avoid
+    // forming references to the `static mut`s).
+    let (ctlr, en, grp) = unsafe {
+        (
+            addr_of!(GICD_CTLR).read(),
+            (&*addr_of!(GICD_ENABLE)),
+            (&*addr_of!(GICD_GROUP)),
+        )
+    };
+    match off {
+        0x000 => ctlr,               // GICD_CTLR
+        0x004 => 0x0000_0001,        // GICD_TYPER: ITLinesNumber=1 → 64 INTIDs, 1 CPU
+        0x008 => 0x0200_143B,        // GICD_IIDR: ARM GICv2 distributor
+        0x080..=0x0fc => grp.get((off - 0x080) / 4).copied().unwrap_or(0), // IGROUPRn
+        0x100..=0x17c => en.get((off - 0x100) / 4).copied().unwrap_or(0),  // ISENABLERn (read=mask)
+        0x180..=0x1fc => en.get((off - 0x180) / 4).copied().unwrap_or(0),  // ICENABLERn (read=mask)
+        0x800..=0x81c => 0x0101_0101, // ITARGETSRn: all target CPU0
+        _ => 0,                       // priorities/config/pending: read as 0 (benign)
+    }
+}
+
+/// Emulate a guest write of `val` to the distributor register at `off`.
+fn gicd_write(off: usize, val: u32) {
+    // SAFETY: single-threaded EL2 access to our own distributor state via raw pointers.
+    unsafe {
+        match off {
+            0x000 => addr_of_mut!(GICD_CTLR).write(val),
+            0x080..=0x0fc => {
+                let g = &mut *addr_of_mut!(GICD_GROUP);
+                if let Some(w) = g.get_mut((off - 0x080) / 4) {
+                    *w = val;
+                }
+            }
+            0x100..=0x17c => {
+                let e = &mut *addr_of_mut!(GICD_ENABLE);
+                if let Some(w) = e.get_mut((off - 0x100) / 4) {
+                    *w |= val; // ISENABLERn: write-1-to-set
+                }
+            }
+            0x180..=0x1fc => {
+                let e = &mut *addr_of_mut!(GICD_ENABLE);
+                if let Some(w) = e.get_mut((off - 0x180) / 4) {
+                    *w &= !val; // ICENABLERn: write-1-to-clear
+                }
+            }
+            _ => {} // IPRIORITYRn / ICFGRn / ISPENDRn / SGIR: accepted, no state needed
+        }
+    }
+}
+
+/// Whether the guest has enabled `intid` in the emulated distributor — the gate on injection.
+fn gicd_irq_enabled(intid: u64) -> bool {
+    let (w, b) = ((intid / 32) as usize, intid % 32);
+    // SAFETY: single-threaded EL2 read of our own state via a raw pointer.
+    unsafe { (&*addr_of!(GICD_ENABLE)).get(w).map(|m| (m >> b) & 1 == 1).unwrap_or(false) }
+}
+
 // ---- Stages 4/7: emulated virtio-mmio devices (MMIO trap-and-emulate) ----
 //
 // The guest sees standard virtio-mmio devices at three IPA slots inside the QEMU `virt` virtio
@@ -320,6 +394,17 @@ impl Vdev {
     const NEW: Vdev = Vdev { status: 0, qsel: 0, qready: 0, q: [Vq::NEW, Vq::NEW] };
 }
 static mut VDEVS: [Vdev; VIRTIO_NDEV] = [Vdev::NEW; VIRTIO_NDEV];
+
+// ---- Stage 9: an initrd / initramfs the hypervisor hands the guest ----
+//
+// A real kernel finds its initial ramdisk (its rootfs, before a real block/net filesystem) through
+// the DTB `/chosen` props `linux,initrd-start` / `linux,initrd-end`. We place a seeded blob in
+// guest RAM (a stand-in rootfs — a real cpio/ext image is an external artifact unavailable here)
+// and advertise it in those props, which is the exact hand-off mechanism a Linux kernel uses.
+const INITRD_OFFSET: u64 = 0x14_0000; // 1.25 MiB into guest RAM (clear of image + DTB)
+const INITRD_IPA: u64 = GUEST_IPA_BASE + INITRD_OFFSET;
+const INITRD: &[u8] = b"BISMUTH-INITRAMFS: a stand-in rootfs the hypervisor handed the guest via DTB /chosen linux,initrd-*\n";
+const INITRD_END: u64 = INITRD_IPA + INITRD.len() as u64;
 
 // A host-backed RAM disk for the block device: 128 × 512-byte sectors, seeded in `seed_blk`.
 const BLK_SECTORS: usize = 128;
@@ -478,6 +563,9 @@ fn build_dtb(mem_base: u64, mem_size: u64) -> usize {
         f.begin(b"chosen");
         f.prop_str(b"bootargs", b"console=ttyAMA0 earlycon");
         f.prop_str(b"stdout-path", b"/pl011@9000000");
+        // Stage 9: advertise the initrd/initramfs (rootfs hand-off) as a real kernel expects.
+        f.prop_cells(b"linux,initrd-start", &[hi(INITRD_IPA), lo(INITRD_IPA)]);
+        f.prop_cells(b"linux,initrd-end", &[hi(INITRD_END), lo(INITRD_END)]);
         f.end();
 
         f.begin(b"psci");
@@ -976,7 +1064,11 @@ extern "C" fn hyp_irq_entry() {
     let intid = (iar & 0x3FF) as u64;
     if intid == CNTHP_INTID {
         arm_el2_timer(); // reload the one-shot and clear the pending condition
-        inject(VTIMER_INTID); // hand the guest its virtual-timer tick
+        // Stage 9: only deliver the tick if the guest has enabled INTID 27 in the emulated GICD —
+        // exactly as real hardware gates an interrupt at the distributor.
+        if gicd_irq_enabled(VTIMER_INTID) {
+            inject(VTIMER_INTID); // hand the guest its virtual-timer tick
+        }
     }
     if intid != 0x3FF {
         write32(GICC + GICC_EOIR, iar); // spurious (1023) needs no EOI
@@ -1067,6 +1159,32 @@ extern "C" fn hvc_entry(frame: *mut u64) {
             let ipa = ((hpfar & 0xF_FFFF_FFF0) << 8) | (far & 0xFFF);
             // Stage 4: a data abort inside the emulated virtio-mmio window is not a violation —
             // trap-and-emulate the register access and resume the guest past the instruction.
+            // Stage 9: a data abort inside the emulated GICv2 distributor window is trap-emulated
+            // the same way (ISS decode → gicd_read/gicd_write) and the guest resumes.
+            if ec == 0x24 && (GICD_IPA..GICD_IPA + GICD_WIN).contains(&ipa) {
+                let iss = esr & 0x1FF_FFFF;
+                if (iss >> 24) & 1 == 1 {
+                    let srt = ((iss >> 16) & 0x1f) as usize;
+                    let wnr = (iss >> 6) & 1;
+                    let off = (ipa - GICD_IPA) as usize;
+                    if wnr == 1 {
+                        let val = if srt == 31 { 0 } else { unsafe { *frame.add(srt) } } as u32;
+                        gicd_write(off, val);
+                    } else {
+                        let val = gicd_read(off);
+                        if srt != 31 {
+                            unsafe { *frame.add(srt) = val as u64 };
+                        }
+                    }
+                    // SAFETY: advancing the guest's return address past the emulated access.
+                    unsafe { asm!("msr elr_el2, {}", in(reg) elr + 4, options(nomem, nostack, preserves_flags)) };
+                    return;
+                }
+                puts(b"[hyp] gicd: un-decodable access (ISV=0) at IPA=");
+                put_hex(ipa);
+                put(b'\n');
+                hyp_exit(1);
+            }
             if ec == 0x24 && (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_WIN_SIZE).contains(&ipa) {
                 let iss = esr & 0x1FF_FFFF;
                 if (iss >> 24) & 1 == 1 {
@@ -1232,6 +1350,23 @@ pub fn run_guest(blob: &[u8]) -> ! {
     puts(b" (");
     put_dec(dtb_total as u64);
     puts(b" bytes): / /chosen(bootargs) /psci /memory /cpus /intc /virtio_mmio x3\n");
+
+    // Stage 9: place the initrd blob in guest RAM at INITRD_OFFSET (advertised in the DTB /chosen).
+    // SAFETY: single-threaded EL2 bring-up; the arena is ours; the blob fits below the stack.
+    unsafe {
+        let dst = (addr_of_mut!(GUEST_RAM) as *mut u8).add(INITRD_OFFSET as usize);
+        for (i, &b) in INITRD.iter().enumerate() {
+            core::ptr::write_volatile(dst.add(i), b);
+        }
+        asm!("dsb ish", options(nostack, preserves_flags));
+    }
+    puts(b"[hyp] initrd at IPA ");
+    put_hex(INITRD_IPA);
+    puts(b"..");
+    put_hex(INITRD_END);
+    puts(b" (");
+    put_dec(INITRD.len() as u64);
+    puts(b" bytes), advertised in DTB /chosen linux,initrd-start/-end\n");
 
     // Seed the virtio-blk RAM disk the guest will read.
     seed_blk();

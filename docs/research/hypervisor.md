@@ -167,6 +167,18 @@ interrupt injection. Guest EL0<->EL1 syscalls run natively and never trap to EL2
     `smc`. QEMU-verified. Because the load/DTB/entry path is the real one, dropping an actual Linux
     `Image` in `hv_kernel` (on hardware, or QEMU with a larger `GUEST_RAM`) boots it.
 
+- **S9 — GICv2 distributor emulation + initrd hand-off (DONE).** The guest's **distributor** (`GICD`
+  @ IPA `0x0800_0000`, 64 KiB) is left unmapped in stage-2 and trap-and-emulated (`gicd_read`/
+  `gicd_write`): `GICD_CTLR`, `GICD_TYPER`, `GICD_IIDR`, `GICD_IGROUPRn`, `GICD_ISENABLERn`/
+  `ICENABLERn` (tracked enable mask), `GICD_ITARGETSRn`. The hardware-timer injection is now **gated
+  on the distributor** — `gicd_irq_enabled(27)` — so the guest gets ticks only after it enables INTID
+  27 in `GICD_ISENABLER0`, exactly as a real kernel programs the distributor at boot. An **initrd**
+  blob is placed in guest RAM and advertised in the DTB `/chosen` props `linux,initrd-start`/`-end`.
+  *Proof:* the `hv_kernel` stand-in programs `GICD_ISENABLER0 |= 1<<27`, reads back `ISENABLER0`
+  (`0x0800_0000`) and `TYPER` (`0x1`), walks the DTB for `linux,initrd-start` (reads `0x4014_0000`
+  and the first initramfs byte), then sets up its GICV CPU interface + `VBAR_EL1` and takes three
+  hardware-timer ticks **gated by the GICD enable it set**, before PSCI `SYSTEM_OFF`. QEMU-verified.
+
 ## What the hypervisor can do today
 
 A `--features hypervisor` Bismuth boot (QEMU `-M virt,virtualization=on`) is a working minimal
@@ -181,15 +193,16 @@ IRQ on its own cadence), **PSCI-over-SMC** power control
 guest **`Image`** (arm64 header parse) and hands it a **generated DTB** in `x0` per the **Linux
 aarch64 boot protocol**. The capstone guests use all of this together — one "OS" prints a banner,
 reads a disk sector, round-trips a network frame, takes timer ticks and powers off via PSCI; the
-`hv_kernel` stand-in is loaded as a real `Image`, validates the DTB hand-off and reads its
-`/chosen` bootargs, then PSCIs off. What a real Linux guest additionally needs (an actual kernel
-image, a fuller GICD, larger device backing) is enumerated next.
+`hv_kernel` stand-in is loaded as a real `Image`, validates the DTB hand-off, programs the emulated
+GICD distributor, reads its `/chosen` bootargs + `linux,initrd-*`, takes GICD-gated hardware-timer
+ticks, then PSCIs off. What a real Linux guest additionally needs (an actual kernel image, larger
+device backing, multi-vCPU) is enumerated next.
 
 ## The honest blocker for *literal* Linux/Docker
 
 Booting a real Linux kernel as the guest needs a Linux `Image` (and, for a distro, a rootfs), i.e. a
 cross-compiled aarch64 Linux build. **This sandbox has no aarch64 Linux toolchain and no network to
-fetch a prebuilt image**, so the entire hypervisor *mechanism* (S1–S8, including the Image-header
+fetch a prebuilt image**, so the entire hypervisor *mechanism* (S1–S9, including the Image-header
 load + DTB generation + boot-protocol entry) is built and QEMU-verified here with hand-assembled
 guests, but the final "unmodified Ubuntu" step requires that external `Image`/rootfs to be supplied.
 The same ceiling the Linux-ABI path hit: Bismuth's side is implemented and testable; producing or
@@ -212,21 +225,33 @@ host), a real guest boots through the same path the `hv_kernel` stand-in exercis
   free-running cadence, injecting the guest's virtual-timer vIRQ with no guest hypercall. (A real
   guest that programs its *own* `CNTV` would also want `CNTVOFF_EL2` + trapping `CNTV` accesses; the
   injection/LR-refill mechanism is the same one proven here.)
-- **vGIC distributor:** present a fuller **GICD** (trap-and-emulate `ISENABLER`/`IPRIORITYR`/etc., or
-  GICv3 `GICR`) — Linux configures the distributor, not just the CPU interface.
+- **vGIC distributor:** ✅ DONE (S9) — the GICv2 **distributor** (`GICD` @ IPA `0x0800_0000`) is now
+  trap-and-emulated (left unmapped in stage-2; faults routed to `gicd_read`/`gicd_write`):
+  `GICD_CTLR`, `GICD_TYPER` (ITLinesNumber → 64 INTIDs), `GICD_IIDR`, `GICD_IGROUPRn`,
+  `GICD_ISENABLERn`/`ICENABLERn` (tracked enable mask), `GICD_ITARGETSRn`. Injection is now **gated
+  on the distributor enable** — the guest receives its virtual-timer tick only after it sets INTID 27
+  in `GICD_ISENABLER0`, exactly as a real kernel programs the distributor. (A full GICv3 `GICR`
+  redistributor model is the only further refinement, for a GICv3 guest.)
+- **initrd / rootfs hand-off:** ✅ DONE (S9) — the hypervisor places an initramfs blob in guest RAM
+  and advertises it in the DTB `/chosen` props `linux,initrd-start` / `linux,initrd-end`, the exact
+  mechanism a Linux kernel uses to find its initial rootfs. (A *real* distro rootfs image is the
+  external artifact below; the hand-off path itself is complete and verified.)
 - **virtio-blk / virtio-net backends:** ✅ DONE (S7) — the virtio-mmio emulator now presents a
   block device (host RAM disk) and a net device (loopback) alongside the console, driven by the
   standard guest handshake + virtqueues. For a real guest: back blk with a Bismuth VFS file / larger
   disk as the rootfs, bridge net to the in-tree NIC, and add used-buffer vIRQ injection (poll → IRQ).
 - **Console:** the S4 virtio-console already serves guest output; add RX for input.
 
-The only genuinely-remaining hypervisor work is the **vGIC distributor** (a fuller GICD/GICv3 GICR
-trap-and-emulate — Linux configures the distributor, not just the CPU interface) and hardening the
-backings for scale (used-buffer vIRQ injection instead of polling, a VFS-file rootfs, a bridged
-NIC, a larger `GUEST_RAM`). None are blocked *in principle* — they are more of the same
-trap-and-emulate S1–S8 already demonstrates — but the final boot still needs the external kernel
-`Image` + rootfs this sandbox cannot provide. Once a real Linux guest boots, `docker`/`k8s` inside
-it is ordinary, unmodified Linux userspace.
+The hypervisor *mechanism* is now complete end-to-end (S1–S9): EL2 boot, stage-2 isolation,
+PSCI/SMC, a hardware-timer-driven vGIC with a trap-emulated **distributor** that gates delivery,
+virtio **console/blk/net** backends, the arm64 `Image`-header + **DTB** (with **initrd** hand-off)
+boot protocol. The remaining items are **scale hardening** (used-buffer vIRQ injection instead of
+polling, a VFS-file rootfs, a bridged NIC, a larger `GUEST_RAM`, multi-vCPU `CPU_ON`, GICv3 `GICR`)
+— none blocked *in principle*, all more of the same trap-and-emulate — and then the one hard
+**external** dependency: a real aarch64 Linux kernel `Image` + rootfs, which this sandbox cannot
+build or fetch (no cross-toolchain, no network, no hardware). On real hardware, or on QEMU with
+`-kernel <Image> -initrd <rootfs>`, a real Linux guest boots through the very path the `hv_kernel`
+stand-in exercises; once it boots, `docker`/`k8s` inside it is ordinary, unmodified Linux userspace.
 
 ## Stage-1 implementation notes
 
@@ -238,8 +263,12 @@ it is ordinary, unmodified Linux userspace.
   `hvc_entry`, and `eret`s back. `run_guest(blob)` prints the EL (proving EL2), copies the guest
   into RAM, sets `HCR_EL2.RW`/`SP_EL1`/`ELR_EL2`/`SPSR_EL2`, and `eret`s to EL1. Hypercall ABI:
   `x0` = command (1 = print `[x1..x1+x2)`, 2 = exit `x1`).
-- Guest: `boards/qemu-virt-aarch64/src/hv_guest.rs` — a decode-verified blob, grown across the
-  stages; at S5 it is the mini "guest OS" (VBAR_EL1 + vector table, virtio-console handshake +
-  banner, vGIC enable + unmask, WFI loop printing timer ticks via the virtio-console, shutdown).
-  Hypercall ABI: `x0` = command (1 = print `[x1..x1+x2)`, 2 = exit `x1`, 3 = inject next timer tick).
+- Guest: the live guest from S8 on is `boards/qemu-virt-aarch64/src/hv_kernel.rs` — a decode-verified
+  blob with a **real arm64 Image header**, loaded through the boot-protocol path. At S9 it validates
+  the DTB, programs the emulated GICD (enables INTID 27, reads back `ISENABLER0`/`TYPER`), reads
+  `/chosen linux,initrd-start` + the handed-off initramfs, sets `VBAR_EL1` + its GICV CPU interface,
+  takes GICD-gated hardware-timer ticks, then PSCI `SYSTEM_OFF`. (The earlier `hv_guest.rs` — the
+  S5–S7 virtio/timer "guest OS" — remains on disk as a historical artifact, no longer compiled.)
+  Hypercall ABI: `x0` = command (1 = print `[x1..x1+x2)`, 2 = exit `x1`, 4 = hex-print `x1`).
+  Assemblers: `scratchpad/mkhvkernel2.py` (S9 kernel), `mkhvos.py` (S5–S7 guest).
 - Run: `bash boards/qemu-virt-aarch64/run-hv.sh` (QEMU `-M virt,virtualization=on`).
