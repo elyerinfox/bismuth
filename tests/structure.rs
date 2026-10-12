@@ -18,6 +18,8 @@ const TCB: &[&str] = &[
     // The virtio-blk driver does DMA (shared rings + bounce buffer), so it is TCB like the
     // other ports' device glue, not a plain safe-over-Mmio driver.
     "src/driver/block/virtio_mmio.rs",
+    // The legacy virtio-pci block driver (x86-64) likewise does DMA via shared rings + buffers.
+    "src/driver/block/virtio_pci.rs",
     // Likewise the virtio-net driver: shared RX/TX virtqueues and frame buffers (DMA).
     "src/net/drivers/virtio_net.rs",
 ];

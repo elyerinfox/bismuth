@@ -34,6 +34,11 @@ Pop-Location
 
 if (-not (Test-Path $Qemu)) { throw "qemu-system-x86_64 not found at $Qemu (set `$env:QEMU)" }
 
+# A scratch disk exposed as a virtio-blk-pci device for the virtio-pci driver to probe.
+$Disk = Join-Path $Image "virtio-disk.img"
+if (-not (Test-Path $Disk)) { $fs = [System.IO.File]::Create($Disk); $fs.SetLength(16MB); $fs.Close() }
+
 Write-Host ">> booting in QEMU (serial on this console; the demo halts QEMU when done, or Ctrl-A X)"
 & $Qemu -drive "format=raw,file=$Img" -serial stdio -display none -no-reboot `
+    -drive "format=raw,file=$Disk,if=none,id=vd0" -device virtio-blk-pci,drive=vd0 `
     -device isa-debug-exit,iobase=0xf4,iosize=0x04

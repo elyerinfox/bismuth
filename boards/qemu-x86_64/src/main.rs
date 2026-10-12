@@ -109,12 +109,33 @@ fn finisher(_: usize) {
     }
 }
 
+/// Scan PCI for a virtio-blk device (QEMU `-device virtio-blk-pci`) and round-trip a sector,
+/// verifying the x86-64 legacy virtio-pci driver end to end.
+fn virtio_blk_test() {
+    use bismuth::driver::block::BlockDevice;
+    use bismuth::driver::block::virtio_pci::VirtioBlkPci;
+    match VirtioBlkPci::probe() {
+        Ok(dev) => {
+            kprintln!("virtio-blk-pci: device up, {} sectors", dev.geometry().block_count);
+            let mut pat = [0u8; 512];
+            for (j, b) in pat.iter_mut().enumerate() {
+                *b = (j as u8).wrapping_mul(7) ^ 0x5A;
+            }
+            let mut back = [0u8; 512];
+            let ok = dev.prog(10, 0, &pat).is_ok() && dev.read(10, 0, &mut back).is_ok() && back == pat;
+            kprintln!("virtio-blk-pci: sector round-trip {}", if ok { "OK" } else { "FAILED" });
+        }
+        Err(e) => kprintln!("virtio-blk-pci: no device attached ({e:?})"),
+    }
+}
+
 fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     bismuth::arch::x86_64::init_console();
     bismuth::console::boot_logo();
     kprintln!("Bismuth {} on x86-64 (QEMU) — stage 3: GDT/TSS + ring-3 user tasks", env!("CARGO_PKG_VERSION"));
     let phys_offset = boot_info.physical_memory_offset.into_option().expect("physical memory not mapped");
     bismuth::arch::x86_64::init_memory(phys_offset, boot_info.kernel_image_offset, boot_info.kernel_len);
+    virtio_blk_test();
 
     // Two sandboxed domains (so killing the rogue cannot touch the well-behaved task), set up
     // and sealed before any unprivileged task is spawned.

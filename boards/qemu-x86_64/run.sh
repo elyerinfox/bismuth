@@ -20,6 +20,12 @@ echo ">> building kernel (stable, x86_64-unknown-none)"
 echo ">> building bootable BIOS image (nightly: bootloader stages)"
 ( cd "$IMAGE" && RUSTUP_TOOLCHAIN=nightly cargo run --quiet -- "$KELF" "$IMAGE/bios.img" >/dev/null )
 
+# A scratch disk exposed as a virtio-blk-pci device, so the virtio-pci driver has something to
+# probe and round-trip a sector through.
+DISK="$IMAGE/virtio-disk.img"
+[ -f "$DISK" ] || head -c $((16*1024*1024)) /dev/zero > "$DISK"
+
 echo ">> booting in QEMU (serial on stdio; the demo halts QEMU when done, or Ctrl-A X)"
 exec "$QEMU" -drive format=raw,file="$IMAGE/bios.img" -serial stdio -display none -no-reboot \
+    -drive format=raw,file="$DISK",if=none,id=vd0 -device virtio-blk-pci,drive=vd0 \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04

@@ -20,6 +20,9 @@
 pub mod cache;
 pub mod control;
 pub mod virtio_mmio;
+// Legacy virtio-pci block transport — x86-64 bare metal only (PCI config + I/O-BAR port I/O).
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub mod virtio_pci;
 #[cfg(feature = "crypto")]
 pub mod crypt;
 pub mod sim;

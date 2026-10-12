@@ -189,3 +189,19 @@ pub fn open_user_range(start: u64, len: u64) -> bool {
     flush_tlb();
     ok
 }
+
+/// Translate a kernel virtual address to its physical address by walking the page tables — the
+/// physical (DMA) address a device must be given for a buffer in kernel memory (x86 does not
+/// identity-map, unlike the aarch64 port). `None` if unmapped or the map offset is not set.
+pub fn translate(vaddr: u64) -> Option<u64> {
+    let w = walk(vaddr)?;
+    // SAFETY: the leaf entry was reached by `walk` (present).
+    let leaf = unsafe { w.chain[w.depth - 1].read_volatile() };
+    let off_mask: u64 = match w.depth {
+        4 => PAGE - 1,          // 4 KiB page
+        3 => (1 << 21) - 1,     // 2 MiB huge page
+        2 => (1 << 30) - 1,     // 1 GiB huge page
+        _ => return None,
+    };
+    Some((leaf & ADDR_MASK & !off_mask) | (vaddr & off_mask))
+}

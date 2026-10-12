@@ -27,6 +27,7 @@ use crate::kernel::{self, Kernel};
 pub mod gdt;
 pub mod idt;
 pub mod paging;
+pub mod pci;
 pub mod pic;
 pub mod sw;
 
