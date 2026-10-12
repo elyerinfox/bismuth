@@ -16,8 +16,13 @@ path = "src/main.rs"
 # No `crypto`/`tpm` here: those RustCrypto crates need SSE, which the soft-float
 # x86_64-unknown-none target disables. Enabling SSE + saving FP state on context switch is
 # the documented follow-up for crypto on x86.
-bismuth-kernel = { path = "../..", default-features = false, features = ["edge", "fs", "power", "extensions", "posix"] }
+bismuth-kernel = { path = "../..", default-features = false, features = ["edge", "fs", "power", "extensions", "posix", "net", "net-ip"] }
 bootloader_api = "0.11.17"
+
+[features]
+# When set, after the virtio-blk probe the board brings up a virtio-net-pci NIC + the IP stack
+# and does an ARP + ICMP/UDP round-trip against QEMU SLIRP. Build/run with run-net.sh.
+net-demo = []
 
 [profile.dev]
 panic = "abort"

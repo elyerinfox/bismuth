@@ -10,10 +10,14 @@
 
 pub mod loopback;
 pub mod virtio_net;
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub mod virtio_net_pci;
 pub mod wire;
 
 pub use loopback::Loopback;
 pub use virtio_net::VirtioNet;
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub use virtio_net_pci::VirtioNetPci;
 pub use wire::{Wire, WireEnd};
 
 #[cfg(not(target_os = "none"))]

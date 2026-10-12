@@ -22,6 +22,8 @@ const TCB: &[&str] = &[
     "src/driver/block/virtio_pci.rs",
     // Likewise the virtio-net driver: shared RX/TX virtqueues and frame buffers (DMA).
     "src/net/drivers/virtio_net.rs",
+    // The x86-64 virtio-net driver over legacy virtio-pci: same DMA rings over port I/O.
+    "src/net/drivers/virtio_net_pci.rs",
 ];
 
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {

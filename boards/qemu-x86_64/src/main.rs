@@ -10,6 +10,8 @@
 //! own domain — the kernel keeps running. Then it exits QEMU. All observable on serial.
 #![no_std]
 #![no_main]
+// The `net-demo` flow replaces the ring-3 demo, so its helpers are unused in that build.
+#![cfg_attr(feature = "net-demo", allow(dead_code, unused_imports))]
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -133,6 +135,80 @@ fn virtio_blk_test() {
     }
 }
 
+/// A virtio-net-pci NIC wrapped in a software RX ring, for the `net-demo` flow.
+#[cfg(feature = "net-demo")]
+static NIC: bismuth::net::SoftRing<bismuth::net::drivers::VirtioNetPci, 8> =
+    bismuth::net::SoftRing::new(bismuth::net::drivers::VirtioNetPci::new());
+#[cfg(feature = "net-demo")]
+static SNET: Stack<16384> = Stack::new();
+
+/// Drive the virtio-net-pci NIC directly (no IP stack): bring it up, then send one broadcast ARP
+/// request for the SLIRP gateway and poll the receive ring for the reply. This exercises the
+/// driver's transmit + receive path end to end against QEMU's emulated NIC + SLIRP, without the
+/// (x86-untested) in-kernel IP stack. Then exit QEMU.
+///
+/// (The IP stack brings the driver no further verification here: its socket/service path hits a
+/// pre-existing x86 fault — the yield-gate `int 0x81` `#GP` — that is out of scope for the driver.)
+#[cfg(feature = "net-demo")]
+fn net_only(_: usize) {
+    use bismuth::net::device::FrameDevice;
+    if let Err(e) = NIC.inner().probe() {
+        kprintln!("virtio-net-pci: no device ({e:?})");
+        bismuth::arch::x86_64::debug_exit(1);
+    }
+    let mac = NIC.inner().mac().0;
+    kprintln!(
+        "virtio-net-pci: device up, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
+
+    // A broadcast ARP request: who-has 10.0.2.2 (the SLIRP gateway), tell 10.0.2.15.
+    let mut frame = [0u8; 42];
+    frame[0..6].copy_from_slice(&[0xff; 6]); // dst = broadcast
+    frame[6..12].copy_from_slice(&mac); // src
+    frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes()); // ethertype ARP
+    frame[14..16].copy_from_slice(&0x0001u16.to_be_bytes()); // htype Ethernet
+    frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes()); // ptype IPv4
+    frame[18] = 6; // hlen
+    frame[19] = 4; // plen
+    frame[20..22].copy_from_slice(&0x0001u16.to_be_bytes()); // oper = request
+    frame[22..28].copy_from_slice(&mac); // sender MAC
+    frame[28..32].copy_from_slice(&[10, 0, 2, 15]); // sender IP
+    frame[38..42].copy_from_slice(&[10, 0, 2, 2]); // target IP
+
+    if let Err(e) = NIC.inner().send(&frame) {
+        kprintln!("virtio-net-pci: ARP send failed ({e:?})");
+        bismuth::arch::x86_64::debug_exit(1);
+    }
+    kprintln!("virtio-net-pci: sent broadcast ARP who-has 10.0.2.2");
+
+    // Poll the RX ring for the gateway's ARP reply.
+    let mut buf = [0u8; 1536];
+    let mut got = None;
+    for _ in 0..2000 {
+        if let Some(n) = NIC.inner().recv(&mut buf) {
+            if n >= 42 && buf[12] == 0x08 && buf[13] == 0x06 && buf[21] == 0x02 {
+                got = Some((n, [buf[22], buf[23], buf[24], buf[25], buf[26], buf[27]]));
+                break;
+            }
+        }
+        task::sleep_ticks(1);
+    }
+    match got {
+        Some((n, rmac)) => {
+            kprintln!(
+                "virtio-net-pci: ARP reply ({n} bytes) 10.0.2.2 is-at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} — TX+RX round-trip verified. PASS",
+                rmac[0], rmac[1], rmac[2], rmac[3], rmac[4], rmac[5]
+            );
+            bismuth::arch::x86_64::debug_exit(0);
+        }
+        None => {
+            kprintln!("virtio-net-pci: no ARP reply received");
+            bismuth::arch::x86_64::debug_exit(1);
+        }
+    }
+}
+
 fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     bismuth::arch::x86_64::init_console();
     bismuth::console::boot_logo();
@@ -141,8 +217,18 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     bismuth::arch::x86_64::init_memory(phys_offset, boot_info.kernel_image_offset, boot_info.kernel_len);
     virtio_blk_test();
 
+    // The networking demo is its own flow (`--features net-demo`): bring up the NIC + IP stack,
+    // do one ICMP round-trip, exit.
+    #[cfg(feature = "net-demo")]
+    {
+        task::spawn("netdemo", 1, &SNET, net_only, 0).unwrap();
+        bismuth::start(1_000_000)
+    }
+
     // Two sandboxed domains (so killing the rogue cannot touch the well-behaved task), set up
     // and sealed before any unprivileged task is spawned.
+    #[cfg(not(feature = "net-demo"))]
+    {
     let app_domain = security::create_domain(DomainSpec::sandboxed("app", 4, 1)).unwrap();
     let rogue_domain = security::create_domain(DomainSpec::sandboxed("rogue", 4, 1)).unwrap();
     let dev = bismuth::driver::register("envx", &SENSOR).expect("register sensor");
@@ -158,6 +244,7 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     ROGUE_DOMAIN.store(rogue_domain.0 as u32, Ordering::Relaxed);
     task::spawn("done", 1, &SD, finisher, 0).unwrap();
     bismuth::start(1_000_000)
+    }
 }
 
 #[panic_handler]
