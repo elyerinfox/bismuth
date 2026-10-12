@@ -205,3 +205,24 @@ fn globals_and_data_segments() {
     // global (100) + the data segment's value loaded from memory (7) = 107.
     assert_eq!(m.invoke("g", &[]).unwrap(), Some(107));
 }
+
+// (import fd_prestat_get) (memory 1) (func (export "p") (result i32)
+//   i32.const 3  i32.const 0  call 0)   ;; fd_prestat_get(3,0) — the startup preopen probe
+const PRESTAT: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x0b, 0x02, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, 0x60, 0x00, 0x01, 0x7f,
+    0x02, 0x29, 0x01, 0x16, b'w', b'a', b's', b'i', b'_', b's', b'n', b'a', b'p', b's', b'h', b'o', b't', b'_', b'p',
+    b'r', b'e', b'v', b'i', b'e', b'w', b'1', 0x0e, b'f', b'd', b'_', b'p', b'r', b'e', b's', b't', b'a', b't', b'_',
+    b'g', b'e', b't', 0x00, 0x00,
+    0x03, 0x02, 0x01, 0x01,
+    0x05, 0x03, 0x01, 0x00, 0x01,
+    0x07, 0x05, 0x01, 0x01, b'p', 0x00, 0x01,
+    0x0a, 0x0a, 0x01, 0x08, 0x00, 0x41, 0x03, 0x41, 0x00, 0x10, 0x00, 0x0b,
+];
+
+#[test]
+fn wasi_fd_prestat_get_signals_no_preopens() {
+    let m = Module::parse(PRESTAT).unwrap();
+    // EBADF (8) is how wasi-libc's startup learns the preopen scan is done.
+    assert_eq!(m.invoke("p", &[]).unwrap(), Some(8));
+}

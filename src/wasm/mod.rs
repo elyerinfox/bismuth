@@ -26,6 +26,10 @@ const MAX_STEPS: u64 = 50_000_000;
 enum Host {
     FdWrite,
     FdRead,
+    FdClose,
+    FdPrestatGet,
+    FdPrestatDirName,
+    FdFdstatGet,
     ProcExit,
     EnvironSizesGet,
     EnvironGet,
@@ -199,6 +203,10 @@ impl Module {
                                 let host = match field {
                                     "fd_write" => Host::FdWrite,
                                     "fd_read" => Host::FdRead,
+                                    "fd_close" => Host::FdClose,
+                                    "fd_prestat_get" => Host::FdPrestatGet,
+                                    "fd_prestat_dir_name" => Host::FdPrestatDirName,
+                                    "fd_fdstat_get" => Host::FdFdstatGet,
                                     "proc_exit" => Host::ProcExit,
                                     "environ_sizes_get" => Host::EnvironSizesGet,
                                     "environ_get" => Host::EnvironGet,
@@ -463,6 +471,20 @@ impl Module {
                 put32(ctx, args[3] as u32 as usize, 0);
                 Ok(Some(0))
             }
+            // No preopened directories: EBADF (8) ends wasi-libc's preopen-scan loop at startup.
+            Host::FdPrestatGet | Host::FdPrestatDirName => Ok(Some(8)),
+            Host::FdFdstatGet => {
+                // Write a 24-byte fdstat: filetype=2 (character device, i.e. a tty) for 0/1/2.
+                let at = args[1] as u32 as usize;
+                if at + 24 <= ctx.mem.len() {
+                    for b in &mut ctx.mem[at..at + 24] {
+                        *b = 0;
+                    }
+                    ctx.mem[at] = 2; // fs_filetype = CHARACTER_DEVICE
+                }
+                Ok(Some(0))
+            }
+            Host::FdClose => Ok(Some(0)),
             Host::FdWrite => {
                 // fd_write(fd, iovs, iovs_len, nwritten) -> errno. Gather the iovecs from linear
                 // memory and write stdout/stderr (fd 1/2) to the kernel console.
