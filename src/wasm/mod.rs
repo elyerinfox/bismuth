@@ -19,12 +19,25 @@ use crate::Error;
 const MAX_CALL_DEPTH: usize = 256;
 const MAX_STEPS: u64 = 50_000_000;
 
-/// A parsed module: function signatures (`i32` counts only), function bodies, and exports.
+/// A WASI host function this engine implements (imported by the module).
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Host {
+    FdWrite,
+    ProcExit,
+    Unknown,
+}
+
+/// A parsed module: function signatures (`i32` counts only), function bodies, exports, imported
+/// host functions (WASI), and the linear-memory minimum.
 pub struct Module {
     /// `(param_count, result_count)` per type.
     types: Vec<(u32, u32)>,
     funcs: Vec<Func>,
     exports: Vec<(String, u32)>,
+    /// Imported functions occupy the low function-index space; each is `(host fn, type index)`.
+    imports: Vec<(Host, u32)>,
+    /// Minimum linear-memory size, in 64 KiB pages (0 = no memory).
+    mem_pages: u32,
 }
 
 struct Func {
@@ -32,6 +45,15 @@ struct Func {
     n_locals: u32,
     body: Vec<u8>,
 }
+
+/// Mutable per-invocation state: the linear memory and a pending `proc_exit` code.
+struct Ctx {
+    mem: Vec<u8>,
+    steps: u64,
+    exit: Option<i32>,
+}
+
+const PAGE: usize = 65536;
 
 struct Reader<'a> {
     b: &'a [u8],
@@ -121,11 +143,71 @@ impl Module {
         let mut type_idx = Vec::new();
         let mut codes: Vec<Vec<u8>> = Vec::new();
         let mut exports = Vec::new();
+        let mut imports: Vec<(Host, u32)> = Vec::new();
+        let mut mem_pages = 0u32;
         while r.p < bin.len() {
             let id = r.byte()?;
             let len = r.u32()? as usize;
             let end = r.p + len;
             match id {
+                2 => {
+                    // Import section: record function imports (they take the low func indices)
+                    // and map each to a host function by its field name.
+                    let n = r.u32()?;
+                    for _ in 0..n {
+                        let ml = r.u32()? as usize;
+                        let _module = r.bytes(ml)?;
+                        let fl = r.u32()? as usize;
+                        let field = core::str::from_utf8(r.bytes(fl)?).map_err(|_| Error::Invalid)?;
+                        let kind = r.byte()?;
+                        match kind {
+                            0x00 => {
+                                let ti = r.u32()?; // type index
+                                let host = match field {
+                                    "fd_write" => Host::FdWrite,
+                                    "proc_exit" => Host::ProcExit,
+                                    _ => Host::Unknown,
+                                };
+                                imports.push((host, ti));
+                            }
+                            0x01 => {
+                                // table: flags + elemtype + limits
+                                let _ = r.byte()?;
+                                let f = r.byte()?;
+                                let _ = r.u32()?;
+                                if f == 1 {
+                                    let _ = r.u32()?;
+                                }
+                            }
+                            0x02 => {
+                                let f = r.byte()?;
+                                let _ = r.u32()?;
+                                if f == 1 {
+                                    let _ = r.u32()?;
+                                }
+                            }
+                            0x03 => {
+                                let _ = r.byte()?; // global valtype
+                                let _ = r.byte()?; // mutability
+                            }
+                            _ => return Err(Error::Unsupported),
+                        }
+                    }
+                }
+                5 => {
+                    // Memory section: one memory, take its minimum page count.
+                    let n = r.u32()?;
+                    for i in 0..n {
+                        let flags = r.byte()?;
+                        let min = r.u32()?;
+                        if flags == 1 {
+                            let _max = r.u32()?;
+                        }
+                        if i == 0 {
+                            mem_pages = min;
+                        }
+                    }
+                }
                 1 => {
                     // Type section: each entry is `0x60 params results` (i32 only).
                     let n = r.u32()?;
@@ -196,22 +278,37 @@ impl Module {
             let body = Vec::from(&code[lr.p..]);
             funcs.push(Func { type_idx: ti, n_locals, body });
         }
-        Ok(Module { types, funcs, exports })
+        Ok(Module { types, funcs, exports, imports, mem_pages })
     }
 
     /// Invoke an exported function by name with `i32` arguments; returns its single `i32` result
     /// (or `None` if it returns nothing).
     pub fn invoke(&self, name: &str, args: &[i32]) -> Result<Option<i32>, Error> {
         let idx = self.exports.iter().find(|(n, _)| n == name).map(|(_, i)| *i).ok_or(Error::NotFound)?;
-        let mut steps = 0u64;
-        self.call(idx, args, 0, &mut steps)
+        let mut ctx = Ctx { mem: alloc::vec::from_elem(0u8, self.mem_pages as usize * PAGE), steps: 0, exit: None };
+        let r = self.call(idx, args, 0, &mut ctx)?;
+        // A `proc_exit` unwinds to here; surface its code as the result.
+        Ok(ctx.exit.map(Some).unwrap_or(r))
     }
 
-    fn call(&self, fidx: u32, args: &[i32], depth: usize, steps: &mut u64) -> Result<Option<i32>, Error> {
+    /// Invoke the module's conventional WASI entry point (`_start`), returning the exit code.
+    pub fn run_wasi(&self) -> Result<i32, Error> {
+        let idx = self.exports.iter().find(|(n, _)| n == "_start").map(|(_, i)| *i).ok_or(Error::NotFound)?;
+        let mut ctx = Ctx { mem: alloc::vec::from_elem(0u8, self.mem_pages as usize * PAGE), steps: 0, exit: None };
+        self.call(idx, &[], 0, &mut ctx)?;
+        Ok(ctx.exit.unwrap_or(0))
+    }
+
+    fn call(&self, fidx: u32, args: &[i32], depth: usize, ctx: &mut Ctx) -> Result<Option<i32>, Error> {
         if depth >= MAX_CALL_DEPTH {
             return Err(Error::NoResources);
         }
-        let f = self.funcs.get(fidx as usize).ok_or(Error::Invalid)?;
+        // Imported functions occupy the low index space; dispatch them to the host (WASI).
+        let n_imports = self.imports.len() as u32;
+        if fidx < n_imports {
+            return self.host_call(self.imports[fidx as usize].0, args, ctx);
+        }
+        let f = self.funcs.get((fidx - n_imports) as usize).ok_or(Error::Invalid)?;
         let (nparams, nresults) = *self.types.get(f.type_idx as usize).ok_or(Error::Invalid)?;
         if args.len() != nparams as usize {
             return Err(Error::Invalid);
@@ -222,19 +319,64 @@ impl Module {
             locals.push(0);
         }
         let mut stack: Vec<i32> = Vec::new();
-        self.run(&f.body, &mut locals, &mut stack, depth, steps)?;
+        self.run(&f.body, &mut locals, &mut stack, depth, ctx)?;
         if nresults == 0 { Ok(None) } else { Ok(stack.pop()) }
+    }
+
+    /// A WASI host call. Minimal preview-1: `fd_write` to the console and `proc_exit`.
+    fn host_call(&self, which: Host, args: &[i32], ctx: &mut Ctx) -> Result<Option<i32>, Error> {
+        match which {
+            Host::ProcExit => {
+                ctx.exit = Some(*args.first().unwrap_or(&0));
+                Ok(None)
+            }
+            Host::FdWrite => {
+                // fd_write(fd, iovs, iovs_len, nwritten) -> errno. Gather the iovecs from linear
+                // memory and write stdout/stderr (fd 1/2) to the kernel console.
+                let (fd, iovs, iovs_len, nwritten) = (args[0], args[1] as usize, args[2] as usize, args[3] as usize);
+                let mem = &ctx.mem;
+                let rd = |o: usize| -> u32 {
+                    u32::from_le_bytes([mem[o], mem[o + 1], mem[o + 2], mem[o + 3]])
+                };
+                let mut total = 0u32;
+                for i in 0..iovs_len {
+                    let base = iovs + i * 8;
+                    if base + 8 > mem.len() {
+                        return Ok(Some(28)); // EFAULT-ish
+                    }
+                    let ptr = rd(base) as usize;
+                    let len = rd(base + 4) as usize;
+                    if ptr + len > mem.len() {
+                        return Ok(Some(28));
+                    }
+                    if fd == 1 || fd == 2 {
+                        if let Ok(s) = core::str::from_utf8(&mem[ptr..ptr + len]) {
+                            crate::console::write_bytes(s.as_bytes());
+                        }
+                    }
+                    total += len as u32;
+                }
+                if nwritten + 4 <= ctx.mem.len() {
+                    ctx.mem[nwritten..nwritten + 4].copy_from_slice(&total.to_le_bytes());
+                }
+                Ok(Some(0))
+            }
+            Host::Unknown => Ok(Some(52)), // ENOSYS
+        }
     }
 
     /// Execute a function body. Structured control flow is handled with a control stack of
     /// `(is_loop, stack_height_at_entry, start_pc, end_pc)`; `br`/`br_if`/`return` unwind it.
-    fn run(&self, body: &[u8], locals: &mut [i32], stack: &mut Vec<i32>, depth: usize, steps: &mut u64) -> Result<(), Error> {
+    fn run(&self, body: &[u8], locals: &mut [i32], stack: &mut Vec<i32>, depth: usize, ctx: &mut Ctx) -> Result<(), Error> {
         let mut ctrl: Vec<Ctrl> = Vec::new();
         let mut pc = 0usize;
         loop {
-            *steps += 1;
-            if *steps > MAX_STEPS {
+            ctx.steps += 1;
+            if ctx.steps > MAX_STEPS {
                 return Err(Error::Timeout);
+            }
+            if ctx.exit.is_some() {
+                return Ok(()); // a nested `proc_exit` unwinds the whole call stack
             }
             let op = *body.get(pc).ok_or(Error::Invalid)?;
             pc += 1;
@@ -290,11 +432,21 @@ impl Module {
                 0x10 => {
                     let (f, n) = uleb_at(body, pc)?;
                     pc += n;
-                    let (np, _) = *self.types.get(self.funcs.get(f as usize).ok_or(Error::Invalid)?.type_idx as usize).ok_or(Error::Invalid)?;
+                    let f = f as u32;
+                    let n_imports = self.imports.len() as u32;
+                    let type_idx = if f < n_imports {
+                        self.imports[f as usize].1
+                    } else {
+                        self.funcs.get((f - n_imports) as usize).ok_or(Error::Invalid)?.type_idx
+                    };
+                    let (np, _) = *self.types.get(type_idx as usize).ok_or(Error::Invalid)?;
                     let at = stack.len().checked_sub(np as usize).ok_or(Error::Invalid)?;
                     let callee_args: Vec<i32> = stack.split_off(at);
-                    if let Some(r) = self.call(f as u32, &callee_args, depth + 1, steps)? {
+                    if let Some(r) = self.call(f, &callee_args, depth + 1, ctx)? {
                         stack.push(r);
+                    }
+                    if ctx.exit.is_some() {
+                        return Ok(());
                     }
                 }
                 0x1a => {
@@ -330,6 +482,48 @@ impl Module {
                 }
                 0x45 => unary(stack, |a| (a == 0) as i32)?,
                 0x46..=0x4f => cmp(stack, op)?,
+                // Linear-memory loads: memarg = align(uleb) + offset(uleb); addr = base + offset.
+                0x28 | 0x2c | 0x2d | 0x2e | 0x2f => {
+                    pc += uleb_at(body, pc)?.1; // align (ignored)
+                    let (off, n) = uleb_at(body, pc)?;
+                    pc += n;
+                    let base = stack.pop().ok_or(Error::Invalid)? as u32 as usize;
+                    let a = base + off as usize;
+                    let m = &ctx.mem;
+                    let v = match op {
+                        0x28 => i32::from_le_bytes([*m.get(a).ok_or(Error::Invalid)?, m[a + 1], m[a + 2], m[a + 3]]),
+                        0x2c => (*m.get(a).ok_or(Error::Invalid)? as i8) as i32,
+                        0x2d => *m.get(a).ok_or(Error::Invalid)? as i32,
+                        0x2e => (i16::from_le_bytes([*m.get(a).ok_or(Error::Invalid)?, m[a + 1]])) as i32,
+                        _ => u16::from_le_bytes([*m.get(a).ok_or(Error::Invalid)?, m[a + 1]]) as i32,
+                    };
+                    stack.push(v);
+                }
+                // Linear-memory stores.
+                0x36 | 0x3a | 0x3b => {
+                    pc += uleb_at(body, pc)?.1;
+                    let (off, n) = uleb_at(body, pc)?;
+                    pc += n;
+                    let v = stack.pop().ok_or(Error::Invalid)?;
+                    let base = stack.pop().ok_or(Error::Invalid)? as u32 as usize;
+                    let a = base + off as usize;
+                    match op {
+                        0x36 => ctx.mem.get_mut(a..a + 4).ok_or(Error::Invalid)?.copy_from_slice(&v.to_le_bytes()),
+                        0x3a => *ctx.mem.get_mut(a).ok_or(Error::Invalid)? = v as u8,
+                        _ => ctx.mem.get_mut(a..a + 2).ok_or(Error::Invalid)?.copy_from_slice(&(v as u16).to_le_bytes()),
+                    }
+                }
+                0x3f => {
+                    pc += 1; // memory index 0x00
+                    stack.push((ctx.mem.len() / PAGE) as i32);
+                }
+                0x40 => {
+                    pc += 1;
+                    let grow = stack.pop().ok_or(Error::Invalid)? as u32 as usize;
+                    let old = ctx.mem.len() / PAGE;
+                    ctx.mem.resize((old + grow) * PAGE, 0);
+                    stack.push(old as i32);
+                }
                 0x67..=0x69 => unary(stack, |a| match op {
                     0x67 => a.leading_zeros() as i32,
                     0x68 => a.trailing_zeros() as i32,
@@ -436,6 +630,12 @@ fn skip(body: &[u8], pc: usize) -> Result<usize, Error> {
         0x02 | 0x03 | 0x04 => p += 1,                       // blocktype
         0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 => p += uleb_at(body, p)?.1, // one uleb
         0x41 => p += sleb(body, p)?.1,                      // i32.const
+        0x28..=0x3e => {
+            // load/store memarg: align uleb + offset uleb
+            p += uleb_at(body, p)?.1;
+            p += uleb_at(body, p)?.1;
+        }
+        0x3f | 0x40 => p += 1, // memory.size / memory.grow: memory index byte
         _ => {}
     }
     Ok(p)
