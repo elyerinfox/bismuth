@@ -13,3 +13,4 @@
 //! Classification: L4 personalities · linux ABI · safe · linux-abi
 
 pub mod elf;
+pub mod stack;
