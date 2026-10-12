@@ -380,6 +380,45 @@ fn partition_governor(_: usize) {
     container::resume(c).unwrap(); // let it observe DONE and exit
 }
 
+static NS_GOV_STACK: bismuth::Stack<4096> = bismuth::Stack::new();
+static NS_LOG: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+
+fn ns_control(_: usize) {
+    let c = container::find("part").unwrap();
+    // UTS namespace: set + read back a hostname.
+    container::set_hostname(c, "node-a").unwrap();
+    let mut hn = [0u8; 32];
+    let n = container::hostname(c, &mut hn).unwrap();
+    let host = core::str::from_utf8(&hn[..n]).unwrap();
+    // PID namespace: the looping worker is a live task of this container.
+    let pids = container::task_count(c);
+    // Memory cgroup: limit is the declaration's ram_bytes (1024); charge up to it then over.
+    let lim = container::mem_limit(c).unwrap();
+    let ok = container::charge_mem(c, 1000).is_ok();
+    let over = container::charge_mem(c, 100).is_err(); // 1100 > 1024
+    let used = container::mem_used(c);
+    container::uncharge_mem(c, 1000);
+    let after = container::mem_used(c);
+    let mut l = NS_LOG.lock().unwrap();
+    l.push(format!("host={host} pids>={} lim={lim} ok={ok} over={over} used={used} after={after}", pids >= 1));
+    PART_DONE.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn namespaces_and_cgroups_expose_the_container_primitives() {
+    let _s = serial();
+    PART_COUNT.store(0, Ordering::Relaxed);
+    PART_DONE.store(false, Ordering::Relaxed);
+    *NS_LOG.lock().unwrap() = Vec::new();
+    sim::run_to_completion(|| {
+        container::install(&PART_MANIFEST).unwrap();
+        container::start(container::find("part").unwrap()).unwrap();
+        task::spawn("ns", 6, &NS_GOV_STACK, ns_control, 0).unwrap();
+    });
+    let l = NS_LOG.lock().unwrap();
+    assert_eq!(*l, ["host=node-a pids>=true lim=1024 ok=true over=true used=1000 after=0".to_string()]);
+}
+
 #[test]
 fn a_suspended_partition_makes_no_progress_until_resumed() {
     let _s = serial();

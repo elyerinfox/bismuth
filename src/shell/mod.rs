@@ -157,8 +157,12 @@ fn con<W: Write>(out: &mut W, words: &mut core::str::SplitWhitespace<'_>) {
             Some(name) => match container::find(name) {
                 Some(id) => match container::health(id) {
                     Ok(h) => {
+                        let mut hn = [0u8; 32];
+                        let n = container::hostname(id, &mut hn).unwrap_or(0);
+                        let host = core::str::from_utf8(&hn[..n]).unwrap_or("?");
                         let _ = writeln!(out, "{name}: {}", if h.running { "running" } else { "stopped" });
-                        let _ = writeln!(out, "  gen={} faults={} violations={} cpu_ticks={}", h.generation, h.faults, h.violations, h.cpu_ticks);
+                        let _ = writeln!(out, "  host={host} pids={} gen={} faults={} violations={}", container::task_count(id), h.generation, h.faults, h.violations);
+                        let _ = writeln!(out, "  cgroup: cpu_ticks={} mem={}/{} bytes", h.cpu_ticks, container::mem_used(id), container::mem_limit(id).unwrap_or(0));
                     }
                     Err(e) => report(out, name, Err(e)),
                 },

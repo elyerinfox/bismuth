@@ -225,7 +225,11 @@ pub struct Health {
 /// container's declaration (entry, fault policy, budget).
 static TABLE: IrqCell<[Option<&'static ContainerDecl>; MAX_DOMAINS]> = IrqCell::new([None; MAX_DOMAINS]);
 
-/// Per-container supervisor state (desired-running + restart bookkeeping per fault window).
+/// Longest container hostname (the UTS-namespace value).
+const HOSTNAME_MAX: usize = 32;
+
+/// Per-container supervisor state (desired-running + restart bookkeeping per fault window) plus
+/// the per-container namespace/cgroup values a container runtime keeps in the kernel.
 #[derive(Copy, Clone, Default)]
 struct RunState {
     /// The supervisor wants this container running (set by `start`, cleared by `stop` and by
@@ -235,8 +239,16 @@ struct RunState {
     restarts: u8,
     /// Tick at which the current fault window started.
     window_start: u64,
+    /// UTS namespace: the container's hostname (`hostname_len` 0 = defaults to its name).
+    hostname: [u8; HOSTNAME_MAX],
+    hostname_len: u8,
+    /// Memory cgroup: bytes currently charged (the `memory.current` analog; the limit is the
+    /// declaration's `ram_bytes`, i.e. `memory.max`).
+    mem_used: u32,
 }
-static STATE: IrqCell<[RunState; MAX_DOMAINS]> = IrqCell::new([RunState { desired: false, restarts: 0, window_start: 0 }; MAX_DOMAINS]);
+static STATE: IrqCell<[RunState; MAX_DOMAINS]> = IrqCell::new(
+    [RunState { desired: false, restarts: 0, window_start: 0, hostname: [0; HOSTNAME_MAX], hostname_len: 0, mem_used: 0 }; MAX_DOMAINS],
+);
 
 /// Domain id of the supervisor container (it is not itself supervised). `None` = kernel domain.
 static SUPERVISOR: IrqCell<Option<u8>> = IrqCell::new(None);
@@ -394,6 +406,104 @@ pub fn resume(c: ContainerId) -> Result<(), Error> {
 /// budget (see [`CpuBudget`]).
 pub fn cpu_used(c: ContainerId) -> u32 {
     crate::kernel::with(|k| k.domain_cpu_used(c.0.0))
+}
+
+// ----- namespaces & cgroups: the per-container kernel constructs a container runtime relies on
+// (the capability model and the CPU budget / task quota already cover caps, `cgroup cpu` and
+// `cgroup pids`; these add the UTS namespace, an explicit PID namespace, and the memory cgroup).
+
+/// UTS namespace: set the container's hostname (truncated to `HOSTNAME_MAX`). Trusted only.
+pub fn set_hostname(c: ContainerId, name: &str) -> Result<(), Error> {
+    if !current_is_trusted() {
+        return Err(Error::PermissionDenied);
+    }
+    with_decl(c, |_| ())?;
+    let b = name.as_bytes();
+    let n = b.len().min(HOSTNAME_MAX);
+    STATE.lock(|s| {
+        let st = &mut s[c.0.0 as usize];
+        st.hostname[..n].copy_from_slice(&b[..n]);
+        st.hostname_len = n as u8;
+    });
+    Ok(())
+}
+
+/// UTS namespace: copy the container's hostname into `out`, returning its length. Falls back to
+/// the container's declared name if none was set.
+pub fn hostname(c: ContainerId, out: &mut [u8]) -> Result<usize, Error> {
+    let (buf, len) = STATE.lock(|s| {
+        let st = &s[c.0.0 as usize];
+        (st.hostname, st.hostname_len as usize)
+    });
+    if len > 0 {
+        let n = len.min(out.len());
+        out[..n].copy_from_slice(&buf[..n]);
+        Ok(n)
+    } else {
+        let name = with_decl(c, |d| d.name())?;
+        let n = name.len().min(out.len());
+        out[..n].copy_from_slice(&name.as_bytes()[..n]);
+        Ok(n)
+    }
+}
+
+/// PID namespace: the number of live (non-`Free`) tasks belonging to the container.
+pub fn task_count(c: ContainerId) -> usize {
+    let d = c.0.0;
+    crate::kernel::with(|k| k.tasks.iter().filter(|t| t.domain == d && !matches!(t.state, crate::TaskState::Free)).count())
+}
+
+/// PID namespace: fill `out` with the [`TaskId`]s of the container's live tasks, returning how
+/// many were written — a container enumerates only its *own* processes, never a sibling's.
+pub fn tasks(c: ContainerId, out: &mut [crate::TaskId]) -> usize {
+    let d = c.0.0;
+    crate::kernel::with(|k| {
+        let mut n = 0;
+        for (i, t) in k.tasks.iter().enumerate() {
+            if n >= out.len() {
+                break;
+            }
+            if t.domain == d && !matches!(t.state, crate::TaskState::Free) {
+                out[n] = crate::kernel::task::TaskId::new(i as u8, t.generation);
+                n += 1;
+            }
+        }
+        n
+    })
+}
+
+/// Memory cgroup: the container's memory limit in bytes (`memory.max`), from its declaration.
+pub fn mem_limit(c: ContainerId) -> Result<u32, Error> {
+    with_decl(c, |d| d.ram_bytes)
+}
+
+/// Memory cgroup: bytes currently charged to the container (`memory.current`).
+pub fn mem_used(c: ContainerId) -> u32 {
+    STATE.lock(|s| s[c.0.0 as usize].mem_used)
+}
+
+/// Memory cgroup: charge `bytes` to the container, refusing (with [`Error::NoResources`]) if it
+/// would exceed the limit — the enforcement point a container's allocator/pool calls before
+/// handing out memory. A limit of 0 means unlimited.
+pub fn charge_mem(c: ContainerId, bytes: u32) -> Result<(), Error> {
+    let limit = mem_limit(c)?;
+    STATE.lock(|s| {
+        let st = &mut s[c.0.0 as usize];
+        let next = st.mem_used.saturating_add(bytes);
+        if limit != 0 && next > limit {
+            return Err(Error::NoResources);
+        }
+        st.mem_used = next;
+        Ok(())
+    })
+}
+
+/// Memory cgroup: release `bytes` previously charged to the container.
+pub fn uncharge_mem(c: ContainerId, bytes: u32) {
+    STATE.lock(|s| {
+        let st = &mut s[c.0.0 as usize];
+        st.mem_used = st.mem_used.saturating_sub(bytes);
+    });
 }
 
 /// One window of an ARINC-653 major frame: a partition (container) and the length of its slot.
