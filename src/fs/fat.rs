@@ -7,9 +7,9 @@
 //! VFAT long-name patents have expired, so a read/write implementation is unencumbered;
 //! exFAT stays under active licensing and is deliberately **not** implemented.
 //!
-//! v1 scope: FAT16 and FAT32 (FAT12 is rejected at mount), 512-byte sectors, 8.3 names for
-//! create, and VFAT long-name **reading** (assembled on lookup/readdir). Long-name
-//! *writing* and FAT12 are documented limitations.
+//! Scope: FAT12, FAT16 and FAT32 (auto-detected at mount by cluster count), 512-byte sectors,
+//! 8.3 names for create, and VFAT long-name **reading** (assembled on lookup/readdir). Long-name
+//! *writing* and cross-directory rename are the remaining documented limitations.
 //!
 //! `FsVnode` is the absolute 32-byte directory-entry slot (`sector * 16 + index`); the root
 //! is the sentinel [`ROOT`]. A node's kind/size/first-cluster are read from that entry.

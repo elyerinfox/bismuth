@@ -243,8 +243,11 @@ pub fn load_and_run(bin: &[u8], name: &'static str, prio: u8, domain: DomainId) 
 fn fs_syscall(i: usize, nr: u64, a: [u64; 6]) -> Option<Outcome> {
     const OPENAT: u64 = 56;
     const CLOSE: u64 = 57;
+    const LSEEK: u64 = 62;
     const READ: u64 = 63;
     const WRITE: u64 = 64;
+    const NEWFSTATAT: u64 = 79;
+    const FSTAT: u64 = 80;
     const AT_FDCWD: i64 = -100;
 
     match nr {
@@ -252,11 +255,93 @@ fn fs_syscall(i: usize, nr: u64, a: [u64; 6]) -> Option<Outcome> {
         READ if a[0] >= FIRST_FD as u64 => Some(rw(i, a, false)),
         WRITE if a[0] >= FIRST_FD as u64 => Some(rw(i, a, true)),
         CLOSE if a[0] >= FIRST_FD as u64 => Some(close(i, a[0])),
+        LSEEK if a[0] >= FIRST_FD as u64 => Some(lseek(i, a)),
+        FSTAT if a[0] >= FIRST_FD as u64 => Some(fstat(i, a[0], a[1])),
+        // newfstatat(dirfd, path, statbuf, flags): with an empty path + AT_EMPTY_PATH it stats the
+        // fd (what libc's fstat uses); otherwise open+stat+close the path under the jail.
+        NEWFSTATAT => Some(newfstatat(i, a)),
         _ => {
             let _ = AT_FDCWD;
             None
         }
     }
+}
+
+/// Fill a Linux `aarch64` `struct stat` (128 bytes) at buffer offset `off` from a VFS `Stat`.
+#[cfg(feature = "fs")]
+fn write_stat(mem: &mut [u8], off: usize, st: &crate::fs::Stat) -> bool {
+    let Some(buf) = mem.get_mut(off..off + 128) else { return false };
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    // st_mode (offset 16, u32): S_IFDIR=0o040000 or S_IFREG=0o100000, perms 0o755.
+    let mode: u32 = if st.kind == crate::fs::NodeKind::Dir { 0o040_755 } else { 0o100_644 };
+    buf[16..20].copy_from_slice(&mode.to_le_bytes());
+    // st_size (offset 48, i64).
+    buf[48..56].copy_from_slice(&(st.size as i64).to_le_bytes());
+    // st_blksize (offset 56, i32) and st_blocks (offset 64, i64).
+    buf[56..60].copy_from_slice(&512i32.to_le_bytes());
+    buf[64..72].copy_from_slice(&(st.blocks as i64).to_le_bytes());
+    true
+}
+
+#[cfg(feature = "fs")]
+fn lseek(i: usize, a: [u64; 6]) -> Outcome {
+    use crate::fs::SeekFrom;
+    let (fd, off, whence) = (a[0], a[1] as i64, a[2]);
+    let slot = (fd as i64 - FIRST_FD) as usize;
+    let Some(file) = PROCS.lock(|p| if slot < MAX_FDS { p[i].fds[slot] } else { None }) else {
+        return Outcome::Return(-9);
+    };
+    let from = match whence {
+        0 => SeekFrom::Start(off as u64), // SEEK_SET
+        1 => SeekFrom::Current(off),      // SEEK_CUR
+        2 => SeekFrom::End(off),          // SEEK_END
+        _ => return Outcome::Return(-22), // EINVAL
+    };
+    match crate::fs::seek(file, from) {
+        Ok(pos) => Outcome::Return(pos as i64),
+        Err(_) => Outcome::Return(-22),
+    }
+}
+
+#[cfg(feature = "fs")]
+fn fstat(i: usize, fd: u64, statbuf: u64) -> Outcome {
+    let slot = (fd as i64 - FIRST_FD) as usize;
+    let Some(file) = PROCS.lock(|p| if slot < MAX_FDS { p[i].fds[slot] } else { None }) else {
+        return Outcome::Return(-9);
+    };
+    let Ok(st) = crate::fs::fstat(file) else { return Outcome::Return(-5) };
+    let base = PROCS.lock(|p| p[i].base);
+    let Some(off) = statbuf.checked_sub(base).map(|x| x as usize) else { return Outcome::Return(-14) };
+    IMAGES[i].lock(|img| if write_stat(&mut img.0, off, &st) { Outcome::Return(0) } else { Outcome::Return(-14) })
+}
+
+#[cfg(feature = "fs")]
+fn newfstatat(i: usize, a: [u64; 6]) -> Outcome {
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    let (dirfd, path_ptr, statbuf, flags) = (a[0], a[1], a[2], a[3]);
+    // fstat()-equivalent: empty path + AT_EMPTY_PATH stats the fd itself.
+    if flags & AT_EMPTY_PATH != 0 || read_cstr(i, path_ptr, &mut [0u8; 1]) == Some(0) {
+        if dirfd >= FIRST_FD as u64 {
+            return fstat(i, dirfd, statbuf);
+        }
+    }
+    // Otherwise open the path under the jail, stat it, close.
+    let Ok(cap) = DirCap::open("root") else { return Outcome::Return(-13) };
+    let mut pbuf = [0u8; 128];
+    let Some(n) = read_cstr(i, path_ptr, &mut pbuf) else { return Outcome::Return(-36) };
+    let Ok(path) = core::str::from_utf8(&pbuf[..n]) else { return Outcome::Return(-22) };
+    let file = match crate::fs::cap_open(&cap, path, OpenMode::READ) {
+        Ok(f) => f,
+        Err(_) => return Outcome::Return(-2),
+    };
+    let st = crate::fs::fstat(file);
+    crate::fs::close(file);
+    let Ok(st) = st else { return Outcome::Return(-5) };
+    let base = PROCS.lock(|p| p[i].base);
+    let Some(off) = statbuf.checked_sub(base).map(|x| x as usize) else { return Outcome::Return(-14) };
+    IMAGES[i].lock(|img| if write_stat(&mut img.0, off, &st) { Outcome::Return(0) } else { Outcome::Return(-14) })
 }
 
 #[cfg(feature = "fs")]
