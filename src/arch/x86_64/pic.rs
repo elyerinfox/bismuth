@@ -5,12 +5,18 @@
 //! Classification: L0 port · x86-64 PIC/PIT · TCB (unsafe allowed) · target_os = "none"
 #![allow(unsafe_code)]
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use super::{inb, outb};
 
 const PIC1_CMD: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
 const PIC2_CMD: u16 = 0xA0;
 const PIC2_DATA: u16 = 0xA1;
+
+const PIT_FREQ: u32 = 1_193_182;
+/// PIT counts per kernel tick (the periodic divisor), recorded at [`init`] for the tickless path.
+static DIVISOR: AtomicU32 = AtomicU32::new(0);
 
 /// Remap the PICs to vectors 0x20..0x2F, mask everything except IRQ0 (the timer), and
 /// program the PIT to fire at `hz`.
@@ -33,8 +39,32 @@ pub fn init(hz: u32) {
 }
 
 fn program_pit(hz: u32) {
-    let divisor = (1_193_182u32 / hz.max(1)).clamp(1, 65_535) as u16;
+    let divisor = (PIT_FREQ / hz.max(1)).clamp(1, 65_535);
+    DIVISOR.store(divisor, Ordering::Relaxed);
     outb(0x43, 0x36); // channel 0, lobyte/hibyte, mode 3 (square wave)
+    outb(0x40, (divisor & 0xFF) as u8);
+    outb(0x40, (divisor >> 8) as u8);
+}
+
+/// Tickless: program the PIT as a one-shot (mode 0) that fires once after `naps` kernel ticks,
+/// suppressing the intermediate periodic ticks. Returns the number of ticks actually armed
+/// (clamped so the 16-bit count does not overflow); the timer ISR restores the periodic cadence
+/// and reconciles the clock by this amount. Only IRQ0 is unmasked, so nothing else wakes `hlt`.
+pub fn arm_oneshot(naps: u64) -> u32 {
+    let divisor = DIVISOR.load(Ordering::Relaxed).max(1);
+    let max_naps = (65_535 / divisor).max(1) as u64;
+    let naps = naps.clamp(1, max_naps) as u32;
+    let count = (naps * divisor).clamp(1, 65_535) as u16;
+    outb(0x43, 0x30); // channel 0, lobyte/hibyte, mode 0 (interrupt on terminal count)
+    outb(0x40, (count & 0xFF) as u8);
+    outb(0x40, (count >> 8) as u8);
+    naps
+}
+
+/// Restore the periodic (mode 3) tick after a one-shot nap.
+pub fn restore_periodic() {
+    let divisor = DIVISOR.load(Ordering::Relaxed).max(1) as u16;
+    outb(0x43, 0x36);
     outb(0x40, (divisor & 0xFF) as u8);
     outb(0x40, (divisor >> 8) as u8);
 }

@@ -55,6 +55,9 @@ pub fn critical<R>(f: impl FnOnce() -> R) -> R {
 
 pub(super) static SWITCH_PENDING: AtomicBool = AtomicBool::new(false);
 pub(super) static ISR_DEPTH: AtomicUsize = AtomicUsize::new(0);
+/// Nonzero while a tickless PIT one-shot is armed: the number of kernel ticks it spans (the
+/// timer ISR uses it to restore the periodic cadence and reconcile the clock).
+pub(super) static NAP_TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Request a context switch; serviced by the timer/IPI path (stage 2).
 #[inline]
@@ -74,13 +77,25 @@ pub(crate) fn idle() {
     unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
 }
 
-/// Tickless light sleep. The 8254 PIT keeps running and its ISR advances the kernel tick,
-/// so halting until the next interrupt loses no time and needs no catch-up; `deadline` is
-/// unused until a Local-APIC one-shot timer is wired in (a later refinement). Any interrupt
-/// — the periodic tick or a device IRQ — wakes the core.
-pub(crate) fn sleep_until(_deadline: Option<u64>) {
-    // SAFETY: `hlt` only waits for an interrupt (interrupts are enabled in the idle task).
-    unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
+/// Tickless light sleep: reprogram the 8254 PIT as a one-shot at the next event and `hlt`,
+/// suppressing the intermediate periodic ticks. Only IRQ0 is unmasked, so the one-shot is the
+/// only thing that wakes the core; its ISR ([`sw::timer_entry`]) restores the periodic cadence
+/// and reconciles the clock by the nap length (`NAP_TICKS`). With no deadline, a plain `hlt`.
+pub(crate) fn sleep_until(deadline: Option<u64>) {
+    match deadline {
+        Some(d) => {
+            let now = kernel::time::ticks();
+            if d <= now {
+                return;
+            }
+            let naps = pic::arm_oneshot(d - now);
+            NAP_TICKS.store(naps, Ordering::Relaxed);
+            // SAFETY: `hlt` waits for the one-shot IRQ (interrupts are enabled in the idle task).
+            unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
+        }
+        // SAFETY: `hlt` only waits for an interrupt.
+        None => unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) },
+    }
 }
 
 /// Lay out a fresh task's initial context-switch frame (see [`sw::init_task`]).

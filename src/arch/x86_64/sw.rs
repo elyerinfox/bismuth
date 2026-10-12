@@ -69,11 +69,22 @@ pub extern "C" fn yield_isr() {
 
 extern "C" fn timer_entry(rsp: u64) -> u64 {
     super::ISR_DEPTH.fetch_add(1, Ordering::SeqCst);
+    // If a tickless one-shot was armed, restore the periodic cadence *before* any task resumes
+    // (so preemption and timekeeping continue), and advance the clock by the whole nap rather
+    // than a single tick.
+    let nap = super::NAP_TICKS.swap(0, Ordering::Relaxed);
+    if nap > 0 {
+        super::pic::restore_periodic();
+    }
     let next = kernel::with(|k| {
         if !FIRST_SWITCH.swap(false, Ordering::Relaxed) {
             k.tasks[k.current as usize].sp = rsp as usize;
         }
-        k.tick();
+        if nap > 0 {
+            k.advance_to(k.tick + nap as u64);
+        } else {
+            k.tick();
+        }
         let n = k.schedule();
         enter(k, n)
     });
