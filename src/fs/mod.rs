@@ -14,12 +14,14 @@
 
 pub mod fat;
 pub mod flash;
+pub mod overlay;
 pub mod ramfs;
 pub mod resident;
 pub mod vnode;
 
 pub use fat::FatFs;
 pub use flash::FlashFs;
+pub use overlay::OverlayFs;
 pub use ramfs::RamFs;
 pub use vnode::{DirEntry, FileSystem, FsInfo, FsVnode, NodeKind, OpenId, OpenMode, Stat};
 
