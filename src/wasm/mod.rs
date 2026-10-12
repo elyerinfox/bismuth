@@ -266,15 +266,15 @@ impl Module {
                         let np = r.u32()?;
                         for _ in 0..np {
                             let t = r.byte()?;
-                            if t != 0x7f && t != 0x7e {
-                                return Err(Error::Unsupported); // i32 / i64 value types
+                            if !matches!(t, 0x7f | 0x7e | 0x7d | 0x7c) {
+                            return Err(Error::Unsupported); // i32 / i64 value types
                             }
                         }
                         let nr = r.u32()?;
                         for _ in 0..nr {
                             let t = r.byte()?;
-                            if t != 0x7f && t != 0x7e {
-                                return Err(Error::Unsupported);
+                            if !matches!(t, 0x7f | 0x7e | 0x7d | 0x7c) {
+                            return Err(Error::Unsupported);
                             }
                         }
                         types.push((np, nr));
@@ -352,8 +352,8 @@ impl Module {
             for _ in 0..decls {
                 let cnt = lr.u32()?;
                 let t = lr.byte()?;
-                if t != 0x7f && t != 0x7e {
-                    return Err(Error::Unsupported);
+                if !matches!(t, 0x7f | 0x7e | 0x7d | 0x7c) {
+                            return Err(Error::Unsupported);
                 }
                 n_locals += cnt;
             }
@@ -546,7 +546,7 @@ impl Module {
                     // A branch to a loop targets its params (none here); to a block/if, its
                     // results — one value for blocktype `i32` (0x7f), none for empty (0x40).
                     let is_loop = op == 0x03;
-                    let br_arity = if !is_loop && (bt == 0x7f || bt == 0x7e) { 1 } else { 0 };
+                    let br_arity = if !is_loop && matches!(bt, 0x7f | 0x7e | 0x7d | 0x7c) { 1 } else { 0 };
                     if op == 0x04 {
                         // if: pop the condition; on false, jump past `else`/to `end`.
                         let c = stack.pop().ok_or(Error::Invalid)?;
@@ -746,6 +746,86 @@ impl Module {
                     let v = stack.pop().ok_or(Error::Invalid)?;
                     stack.push((v as u32) as i64); // i64.extend_i32_u
                 }
+                // Floating point. f32 lives in the low 32 bits of the cell, f64 in all 64.
+                0x43 => {
+                    let bits = u32::from_le_bytes([*body.get(pc).ok_or(Error::Invalid)?, body[pc + 1], body[pc + 2], body[pc + 3]]);
+                    pc += 4;
+                    stack.push(bits as i64); // f32.const
+                }
+                0x44 => {
+                    let mut b8 = [0u8; 8];
+                    b8.copy_from_slice(body.get(pc..pc + 8).ok_or(Error::Invalid)?);
+                    pc += 8;
+                    stack.push(i64::from_le_bytes(b8)); // f64.const
+                }
+                0x2a | 0x2b | 0x38 | 0x39 => {
+                    // f32/f64 load (0x2a/0x2b) and store (0x38/0x39).
+                    pc += uleb_at(body, pc)?.1;
+                    let (off, n) = uleb_at(body, pc)?;
+                    pc += n;
+                    match op {
+                        0x2a | 0x2b => {
+                            let base = stack.pop().ok_or(Error::Invalid)? as u32 as usize;
+                            let a = base + off as usize;
+                            if op == 0x2a {
+                                let m = ctx.mem.get(a..a + 4).ok_or(Error::Invalid)?;
+                                stack.push(u32::from_le_bytes([m[0], m[1], m[2], m[3]]) as i64);
+                            } else {
+                                let m = ctx.mem.get(a..a + 8).ok_or(Error::Invalid)?;
+                                let mut b8 = [0u8; 8];
+                                b8.copy_from_slice(m);
+                                stack.push(i64::from_le_bytes(b8));
+                            }
+                        }
+                        _ => {
+                            let v = stack.pop().ok_or(Error::Invalid)?;
+                            let base = stack.pop().ok_or(Error::Invalid)? as u32 as usize;
+                            let a = base + off as usize;
+                            if op == 0x38 {
+                                ctx.mem.get_mut(a..a + 4).ok_or(Error::Invalid)?.copy_from_slice(&(v as u32).to_le_bytes());
+                            } else {
+                                ctx.mem.get_mut(a..a + 8).ok_or(Error::Invalid)?.copy_from_slice(&v.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+                0x5b..=0x60 => fcmp32(stack, op)?,
+                0x61..=0x66 => fcmp64(stack, op)?,
+                0x8b | 0x8c | 0x92..=0x98 => fop32(stack, op)?,
+                0x99 | 0x9a | 0xa0..=0xa6 => fop64(stack, op)?,
+                // Conversions between the numeric types.
+                0xa8 | 0xaa => unary_f32(stack, |x| x as i32)?,           // i32.trunc_f32_s/u
+                0xa9 | 0xab => unary_f32(stack, |x| x as u32 as i32)?,
+                0xae | 0xb0 => {
+                    let x = f32::from_bits(stack.pop().ok_or(Error::Invalid)? as u32);
+                    stack.push(x as i64); // i64.trunc_f32_s/u (saturating-ish)
+                }
+                0xb2 => {
+                    let v = stack.pop().ok_or(Error::Invalid)? as i32;
+                    stack.push(f32::to_bits(v as f32) as i64); // f32.convert_i32_s
+                }
+                0xb3 => {
+                    let v = stack.pop().ok_or(Error::Invalid)? as u32;
+                    stack.push(f32::to_bits(v as f32) as i64); // f32.convert_i32_u
+                }
+                0xb7 => {
+                    let v = stack.pop().ok_or(Error::Invalid)? as i32;
+                    stack.push(f64::to_bits(v as f64) as i64); // f64.convert_i32_s
+                }
+                0xb8 => {
+                    let v = stack.pop().ok_or(Error::Invalid)? as u32;
+                    stack.push(f64::to_bits(v as f64) as i64); // f64.convert_i32_u
+                }
+                0xb6 => {
+                    let x = f64::from_bits(stack.pop().ok_or(Error::Invalid)? as u64);
+                    stack.push(f32::to_bits(x as f32) as i64); // f32.demote_f64
+                }
+                0xbb => {
+                    let x = f32::from_bits(stack.pop().ok_or(Error::Invalid)? as u32);
+                    stack.push(f64::to_bits(x as f64) as i64); // f64.promote_f32
+                }
+                // Reinterpret casts are no-ops on the bit pattern in the cell.
+                0xbc | 0xbd | 0xbe | 0xbf => {}
                 _ => return Err(Error::Unsupported),
             }
         }
@@ -849,6 +929,100 @@ fn binop64(stack: &mut Vec<i64>, op: u8) -> Result<(), Error> {
     Ok(())
 }
 
+fn pop_f32(stack: &mut Vec<i64>) -> Result<f32, Error> {
+    Ok(f32::from_bits(stack.pop().ok_or(Error::Invalid)? as u32))
+}
+fn pop_f64(stack: &mut Vec<i64>) -> Result<f64, Error> {
+    Ok(f64::from_bits(stack.pop().ok_or(Error::Invalid)? as u64))
+}
+
+fn unary_f32(stack: &mut Vec<i64>, f: impl Fn(f32) -> i32) -> Result<(), Error> {
+    let x = pop_f32(stack)?;
+    stack.push(f(x) as i64);
+    Ok(())
+}
+
+fn fcmp32(stack: &mut Vec<i64>, op: u8) -> Result<(), Error> {
+    let b = pop_f32(stack)?;
+    let a = pop_f32(stack)?;
+    let r = match op {
+        0x5b => a == b,
+        0x5c => a != b,
+        0x5d => a < b,
+        0x5e => a > b,
+        0x5f => a <= b,
+        _ => a >= b,
+    };
+    stack.push(r as i64);
+    Ok(())
+}
+
+fn fcmp64(stack: &mut Vec<i64>, op: u8) -> Result<(), Error> {
+    let b = pop_f64(stack)?;
+    let a = pop_f64(stack)?;
+    let r = match op {
+        0x61 => a == b,
+        0x62 => a != b,
+        0x63 => a < b,
+        0x64 => a > b,
+        0x65 => a <= b,
+        _ => a >= b,
+    };
+    stack.push(r as i64);
+    Ok(())
+}
+
+// f32 abs/neg/copysign are bit operations; +,-,*,/ and min/max avoid libm (no sqrt/ceil/…).
+fn fop32(stack: &mut Vec<i64>, op: u8) -> Result<(), Error> {
+    if op == 0x8b || op == 0x8c {
+        let a = pop_f32(stack)?;
+        let r = if op == 0x8b { f32::from_bits(a.to_bits() & 0x7fff_ffff) } else { f32::from_bits(a.to_bits() ^ 0x8000_0000) };
+        stack.push(f32::to_bits(r) as i64);
+        return Ok(());
+    }
+    let b = pop_f32(stack)?;
+    let a = pop_f32(stack)?;
+    let r = match op {
+        0x92 => a + b,
+        0x93 => a - b,
+        0x94 => a * b,
+        0x95 => a / b,
+        0x96 => if a < b { a } else { b },
+        0x97 => if a > b { a } else { b },
+        0x98 => f32::from_bits((a.to_bits() & 0x7fff_ffff) | (b.to_bits() & 0x8000_0000)),
+        _ => return Err(Error::Unsupported),
+    };
+    stack.push(f32::to_bits(r) as i64);
+    Ok(())
+}
+
+fn fop64(stack: &mut Vec<i64>, op: u8) -> Result<(), Error> {
+    if op == 0x99 || op == 0x9a {
+        let a = pop_f64(stack)?;
+        let r = if op == 0x99 {
+            f64::from_bits(a.to_bits() & 0x7fff_ffff_ffff_ffff)
+        } else {
+            f64::from_bits(a.to_bits() ^ 0x8000_0000_0000_0000)
+        };
+        stack.push(f64::to_bits(r) as i64);
+        return Ok(());
+    }
+    let b = pop_f64(stack)?;
+    let a = pop_f64(stack)?;
+    let r = match op {
+        0xa0 => a + b,
+        0xa1 => a - b,
+        0xa2 => a * b,
+        0xa3 => a / b,
+        0xa4 => if a < b { a } else { b },
+        0xa5 => if a > b { a } else { b },
+        0xa6 => f64::from_bits((a.to_bits() & 0x7fff_ffff_ffff_ffff) | (b.to_bits() & 0x8000_0000_0000_0000)),
+        _ => return Err(Error::Unsupported),
+    };
+    stack.push(f64::to_bits(r) as i64);
+    Ok(())
+}
+
 /// A control frame on the structured-control stack.
 struct Ctrl {
     is_loop: bool,
@@ -892,6 +1066,8 @@ fn skip(body: &[u8], pc: usize) -> Result<usize, Error> {
         0x02 | 0x03 | 0x04 => p += 1,                       // blocktype
         0x0c | 0x0d | 0x10 | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 => p += uleb_at(body, p)?.1, // one uleb
         0x41 | 0x42 => p += sleb(body, p)?.1,               // i32.const / i64.const
+        0x43 => p += 4,                                     // f32.const
+        0x44 => p += 8,                                     // f64.const
         0x28..=0x3e => {
             // load/store memarg: align uleb + offset uleb
             p += uleb_at(body, p)?.1;
