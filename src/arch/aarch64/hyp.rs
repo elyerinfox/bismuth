@@ -7,11 +7,14 @@
 //! (1 = print a string the guest owns, 2 = exit). The guest's output therefore appears *through*
 //! the hypervisor, proving the EL1→EL2 trap round-trip.
 //!
-//! Stage-1 scope (deliberately minimal — see `docs/research/hypervisor.md` for the roadmap):
-//! the MMU is left **off** at both EL2 and the guest's EL1, so there is no stage-2 translation
-//! yet: the guest shares the host's flat physical address space and is trusted hand-assembled
-//! code, not an isolated VM. Printing is direct PL011 MMIO (no kernel console/locks, so no
-//! atomics are needed with the MMU off). Stage 2 adds the EL2 MMU + stage-2 guest isolation.
+//! Built out across staged increments (see `docs/research/hypervisor.md`): S1 EL2 boot + the
+//! `HVC` hypercall gate; S2 stage-2 translation (the guest's isolated guest-physical RAM); S3
+//! the vGIC (GICv2 list-register injection + a virtual CPU interface mapped to the guest); S4 an
+//! emulated virtio-mmio console (MMIO trap-and-emulate + virtqueue drain); S5 a guest "OS" using
+//! all of it; S6 a **hardware-timer-driven** tick (the EL2 physical timer injects the guest's
+//! virtual-timer IRQ on a free-running cadence) and **PSCI-over-SMC** emulation (`VERSION`,
+//! `CPU_ON`, `SYSTEM_OFF`/`RESET`, `FEATURES`) so a guest powers itself off the standard way.
+//! EL2 runs MMU-off; printing is direct PL011 MMIO (single-threaded, no locks/atomics).
 //!
 //! Classification: L0 port · aarch64 hypervisor · TCB (unsafe allowed) · target_os = "none"
 #![allow(unsafe_code)]
@@ -49,6 +52,34 @@ const GICV_PA: u64 = 0x0804_0000; // host-physical virtual CPU interface
 const GUEST_GICC_IPA: u64 = 0x0801_0000; // where the guest expects its GIC CPU interface
 /// The ARM virtual-timer PPI (`CNTV`), the vINTID we inject as the guest's timer tick.
 const VTIMER_INTID: u64 = 27;
+
+// ---- Stage 6: a hardware-timer-driven tick ----
+//
+// The hypervisor arms the EL2 physical timer (`CNTHP_*_EL2`, PPI INTID 26). Because `HCR_EL2.IMO`
+// routes physical IRQs to EL2 while the guest runs at EL1, that timer fires *to EL2* on a
+// free-running cadence regardless of what the guest does; the EL2 IRQ handler re-arms it and
+// injects the guest's virtual-timer vIRQ (INTID 27) through GICH. The guest therefore receives a
+// periodic timer without ever asking for the next tick (replacing the stage-3 `HVC_TICK` cadence).
+const GICC_IAR: usize = 0x0C; // interrupt acknowledge (host CPU interface)
+const GICC_EOIR: usize = 0x10; // end of interrupt
+const GICD_ISENABLER0: usize = 0x100; // set-enable, IRQs 0..31
+const CNTHP_INTID: u64 = 26; // non-secure EL2 physical timer PPI
+/// Ticks per second: the EL2 timer fires `CNTFRQ/HV_TICK_DIV` apart (≈0.2 s on QEMU `virt`).
+const HV_TICK_DIV: u64 = 5;
+
+// ---- Stage 6: PSCI (power state coordination) over SMC ----
+//
+// A real guest OS powers the machine off, resets, and brings up CPUs via PSCI — `SMC #0` with a
+// function id in `x0`. `HCR_EL2.TSC` traps EL1 `SMC` to EL2 (ESR_EL2 EC 0x17); the hypervisor
+// emulates the PSCI 1.1 subset a single-vCPU guest needs. Return values follow the PSCI spec.
+const PSCI_VERSION: u64 = 0x8400_0000;
+const PSCI_CPU_ON_32: u64 = 0x8400_0003;
+const PSCI_CPU_ON_64: u64 = 0xC400_0003;
+const PSCI_MIGRATE_INFO_TYPE: u64 = 0x8400_0006;
+const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+const PSCI_FEATURES: u64 = 0x8400_000A;
+const PSCI_NOT_SUPPORTED: i64 = -1;
 
 // ---- Stage 2: the guest's own guest-physical (IPA) address space ----
 //
@@ -124,9 +155,12 @@ fn setup_stage2() {
         l2lo.add(l2lo_idx).write_volatile((l3 as u64) | 0x3);
         l1.add(0).write_volatile((l2lo as u64) | 0x3);
 
-        // VTCR_EL2: T0SZ=24 (40-bit IPA), SL0=1 (start L1), IRGN0/ORGN0=WB, SH0=inner, TG0=4KiB,
-        // PS=40-bit, bit31 RES1.
-        let vtcr: u64 = 0x8000_0000 | 24 | (1 << 6) | (1 << 8) | (1 << 10) | (3 << 12) | (2 << 16);
+        // VTCR_EL2: T0SZ=25 (39-bit IPA), SL0=1 (start L1), IRGN0/ORGN0=WB, SH0=inner, TG0=4KiB,
+        // PS=40-bit, bit31 RES1. T0SZ=25 keeps the level-1 lookup to one 512-entry table (9 bits,
+        // IPA[38:30]); T0SZ=24 would push it into *concatenated* L1 tables needing an 8 KiB-aligned
+        // base, which `S2_L1` (4 KiB-aligned) only satisfied by layout luck — a latent level-1
+        // translation fault. A 39-bit IPA still covers the guest's RAM (0x4000_0000) and GIC.
+        let vtcr: u64 = 0x8000_0000 | 25 | (1 << 6) | (1 << 8) | (1 << 10) | (3 << 12) | (2 << 16);
         let vttbr = addr_of_mut!(S2_L1) as u64; // VMID 0
         asm!(
             "dsb ish",
@@ -148,6 +182,62 @@ fn write32(addr: usize, val: u32) {
     unsafe { core::ptr::write_volatile(addr as *mut u32, val) };
 }
 
+/// Read a 32-bit MMIO register.
+fn read32(addr: usize) -> u32 {
+    // SAFETY: MMIO on a GIC register the hypervisor owns.
+    unsafe { core::ptr::read_volatile(addr as *const u32) }
+}
+
+/// Read `CNTFRQ_EL0` (the generic-timer input frequency).
+fn cntfrq() -> u64 {
+    let f: u64;
+    // SAFETY: reading the counter frequency is side-effect free.
+    unsafe { asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+    f
+}
+
+/// Arm (or re-arm) the EL2 physical timer to fire one tick from now: reload `CNTHP_TVAL_EL2` and
+/// enable it. Writing TVAL both sets the next deadline and clears any pending condition, so this is
+/// also how the IRQ handler acknowledges the timer for the next period.
+fn arm_el2_timer() {
+    let interval = (cntfrq() / HV_TICK_DIV).max(1);
+    // SAFETY: EL2 timer registers, accessible at EL2; a one-shot reload with ENABLE=1, IMASK=0.
+    unsafe {
+        asm!(
+            "msr cnthp_tval_el2, {t}",
+            "msr cnthp_ctl_el2, {c}",
+            "isb",
+            t = in(reg) interval,
+            c = in(reg) 1u64,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Emulate one PSCI call (`SMC #0`, function id in `func`). Power-off/reset stop the VM and never
+/// return; the rest yield a value for the guest's `x0`. A single-vCPU guest: `CPU_ON` is refused.
+fn psci(func: u64, _arg: u64, feat_fn: u64) -> i64 {
+    match func {
+        PSCI_VERSION => 0x0001_0001, // PSCI v1.1
+        PSCI_MIGRATE_INFO_TYPE => 2, // 2 = Trusted OS not present / migration not required
+        PSCI_CPU_ON_32 | PSCI_CPU_ON_64 => PSCI_NOT_SUPPORTED, // single vCPU
+        PSCI_FEATURES => match feat_fn {
+            PSCI_VERSION | PSCI_MIGRATE_INFO_TYPE | PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET
+            | PSCI_FEATURES | PSCI_CPU_ON_32 | PSCI_CPU_ON_64 => 0, // supported
+            _ => PSCI_NOT_SUPPORTED,
+        },
+        PSCI_SYSTEM_OFF => {
+            puts(b"[hyp] guest PSCI SYSTEM_OFF -- powering the VM off\n");
+            hyp_exit(0);
+        }
+        PSCI_SYSTEM_RESET => {
+            puts(b"[hyp] guest PSCI SYSTEM_RESET -- stopping the VM\n");
+            hyp_exit(0);
+        }
+        _ => PSCI_NOT_SUPPORTED,
+    }
+}
+
 /// Enable the GICv2 hypervisor interface so list-register injections reach the guest's GICV, and
 /// seed the virtual CPU-interface control (GICH_VMCR): VENG0+VENG1 (both groups enabled) and
 /// VPMR = top priority = 0x1F (accept all) — so a pending list register is actually signalled to
@@ -156,6 +246,7 @@ fn gich_enable() {
     // The virtual CPU interface sits behind the physical GIC, so the host must enable the
     // physical distributor + CPU interface for virtual delivery to work.
     write32(GICD + 0x0, 1); // GICD_CTLR.Enable
+    write32(GICD + GICD_ISENABLER0, 1 << CNTHP_INTID); // enable the EL2 physical-timer PPI (26)
     write32(GICC + 0x4, 0xFF); // GICC_PMR = accept all
     write32(GICC + 0x0, 1); // GICC_CTLR.Enable
     write32(GICH + GICH_HCR, 1); // GICH_HCR.En = 1
@@ -385,9 +476,9 @@ pub extern "C" fn hyp_vectors() {
         ".balign 0x80", "b {bad}",
         ".balign 0x80", "b {bad}",
         ".balign 0x80", "b {bad}",
-        // Lower EL using AArch64 (the guest at EL1): Sync = HVC gate.
+        // Lower EL using AArch64 (the guest at EL1): Sync = HVC/SMC gate, IRQ = EL2 timer.
         ".balign 0x80", "b {sync}",
-        ".balign 0x80", "b {bad}",
+        ".balign 0x80", "b {irq}",
         ".balign 0x80", "b {bad}",
         ".balign 0x80", "b {bad}",
         // Lower EL using AArch32 (unused).
@@ -396,8 +487,68 @@ pub extern "C" fn hyp_vectors() {
         ".balign 0x80", "b {bad}",
         ".balign 0x80", "b {bad}",
         sync = sym hvc_vector,
+        irq = sym hyp_irq_vector,
         bad = sym hyp_bad,
     )
+}
+
+/// Guest IRQ taken to EL2 (`HCR_EL2.IMO`): the EL2 physical timer. Save/restore all guest GPRs
+/// around the handler and `eret` back into the guest.
+#[unsafe(naked)]
+extern "C" fn hyp_irq_vector() {
+    naked_asm!(
+        "sub sp, sp, #256",
+        "stp x0, x1, [sp, #0]",
+        "stp x2, x3, [sp, #16]",
+        "stp x4, x5, [sp, #32]",
+        "stp x6, x7, [sp, #48]",
+        "stp x8, x9, [sp, #64]",
+        "stp x10, x11, [sp, #80]",
+        "stp x12, x13, [sp, #96]",
+        "stp x14, x15, [sp, #112]",
+        "stp x16, x17, [sp, #128]",
+        "stp x18, x19, [sp, #144]",
+        "stp x20, x21, [sp, #160]",
+        "stp x22, x23, [sp, #176]",
+        "stp x24, x25, [sp, #192]",
+        "stp x26, x27, [sp, #208]",
+        "stp x28, x29, [sp, #224]",
+        "str x30, [sp, #240]",
+        "bl {entry}",
+        "ldp x0, x1, [sp, #0]",
+        "ldp x2, x3, [sp, #16]",
+        "ldp x4, x5, [sp, #32]",
+        "ldp x6, x7, [sp, #48]",
+        "ldp x8, x9, [sp, #64]",
+        "ldp x10, x11, [sp, #80]",
+        "ldp x12, x13, [sp, #96]",
+        "ldp x14, x15, [sp, #112]",
+        "ldp x16, x17, [sp, #128]",
+        "ldp x18, x19, [sp, #144]",
+        "ldp x20, x21, [sp, #160]",
+        "ldp x22, x23, [sp, #176]",
+        "ldp x24, x25, [sp, #192]",
+        "ldp x26, x27, [sp, #208]",
+        "ldp x28, x29, [sp, #224]",
+        "ldr x30, [sp, #240]",
+        "add sp, sp, #256",
+        "eret",
+        entry = sym hyp_irq_entry,
+    )
+}
+
+/// Service an EL2 IRQ. Acknowledge via the physical GIC CPU interface; if it is the EL2 physical
+/// timer, re-arm it for the next period and inject the guest's virtual-timer vIRQ; then EOI.
+extern "C" fn hyp_irq_entry() {
+    let iar = read32(GICC + GICC_IAR);
+    let intid = (iar & 0x3FF) as u64;
+    if intid == CNTHP_INTID {
+        arm_el2_timer(); // reload the one-shot and clear the pending condition
+        inject(VTIMER_INTID); // hand the guest its virtual-timer tick
+    }
+    if intid != 0x3FF {
+        write32(GICC + GICC_EOIR, iar); // spurious (1023) needs no EOI
+    }
 }
 
 /// Guest synchronous exception from EL1: save the guest GPRs, service the hypercall, restore, and
@@ -453,6 +604,21 @@ extern "C" fn hvc_entry(frame: *mut u64) {
     // SAFETY: reading the EL2 syndrome register is side-effect free.
     unsafe { asm!("mrs {}, esr_el2", out(reg) esr, options(nomem, nostack, preserves_flags)) };
     let ec = esr >> 26;
+    if ec == 0x17 {
+        // SMC from EL1, trapped by HCR_EL2.TSC: emulate PSCI. The function id is in x0, args in
+        // x1.. ; a trapped SMC does NOT advance the PC, so bump ELR_EL2 past it before returning.
+        // SAFETY: `frame` holds the guest GPR image; x0 = PSCI function, x1 = arg / queried fn.
+        let (func, arg) = unsafe { (*frame, *frame.add(1)) };
+        let ret = psci(func, arg, arg);
+        // SAFETY: deliver the PSCI result in the guest's x0 and skip the `smc` instruction.
+        unsafe {
+            *frame = ret as u64;
+            let elr: u64;
+            asm!("mrs {}, elr_el2", out(reg) elr, options(nomem, nostack, preserves_flags));
+            asm!("msr elr_el2, {}", in(reg) elr + 4, options(nomem, nostack, preserves_flags));
+        }
+        return;
+    }
     if ec != 0x16 {
         // Not an HVC — a genuine guest fault. A stage-2 abort (EC 0x24 data / 0x20 instruction
         // from a lower EL) carries the faulting guest-physical address in HPFAR_EL2; report it
@@ -609,15 +775,18 @@ pub fn run_guest(blob: &[u8]) -> ! {
     puts(b"..+2MiB -> HPA=");
     put_hex(guest_ram_hpa());
     put(b'\n');
-    // Stage 3: bring up the vGIC and inject the first virtual-timer interrupt, so the guest takes
-    // it as soon as it enables its CPU interface and unmasks IRQs.
+    // Stage 3/6: bring up the vGIC, then arm the EL2 physical timer. Its interrupt fires to EL2 on
+    // a free-running cadence (HCR_EL2.IMO routes it up while the guest runs at EL1); the EL2 IRQ
+    // handler injects the guest's virtual-timer vIRQ each period — the guest no longer asks for it.
     gich_enable();
-    inject(VTIMER_INTID);
+    arm_el2_timer();
     puts(b"[hyp] vGIC up (GICH enabled); guest GIC CPU iface = GICV @ IPA ");
     put_hex(GUEST_GICC_IPA);
-    puts(b"; injected vINTID ");
+    puts(b"; EL2 physical timer armed -> injects vINTID ");
     put_dec(VTIMER_INTID);
-    put(b'\n');
+    puts(b" every ~1/");
+    put_dec(HV_TICK_DIV);
+    puts(b" s\n");
     puts(b"[hyp] launching guest at EL1, entry IPA=");
     put_hex(entry);
     put(b'\n');
@@ -630,15 +799,16 @@ pub fn run_guest(blob: &[u8]) -> ! {
         asm!(
             "msr vbar_el2, {vbar}",
             "isb",
-            "msr hcr_el2, {hcr}",     // RW=1 (EL1 AArch64) | VM=1 (stage-2) | IMO=1 (route IRQs to
-                                      // EL2 and signal virtual IRQs from the vGIC to EL1)
+            "msr hcr_el2, {hcr}",     // RW=1 (EL1 AArch64) | VM=1 (stage-2) | IMO=1 (route physical
+                                      // IRQs to EL2 + signal vGIC virtual IRQs to EL1) | TSC=1
+                                      // (trap the guest's SMC/PSCI to EL2)
             "msr sp_el1, {gsp}",
             "msr elr_el2, {entry}",
             "msr spsr_el2, {spsr}",   // EL1h, DAIF masked
             "isb",
             "eret",
             vbar = in(reg) vbar,
-            hcr = in(reg) 0x8000_0011u64,
+            hcr = in(reg) 0x8008_0011u64,
             gsp = in(reg) gsp,
             entry = in(reg) entry,
             spsr = in(reg) 0x3c5u64,

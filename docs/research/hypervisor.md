@@ -116,9 +116,22 @@ interrupt injection. Guest EL0<->EL1 syscalls run natively and never trap to EL2
   (Current-EL-SPx slot), which acks via `GICV_AIAR`, prints `scheduler tick #N` **through the
   virtio-console** (not a raw hypercall), `GICV_AEOIR`s, and requests the next tick via `HVC_TICK`;
   after 5 ticks it prints a shutdown line and `HVC_EXIT`s. QEMU-verified end to end — banner, five
-  ticks, clean shutdown — exercising stage-2 RAM + vGIC + virtio-console in one guest. Timer-driver
-  choice: the S3-documented `HVC_TICK` re-inject cadence (the guest requests the next tick from its
-  handler), not a hardware `CNTV`-armed maintenance loop at EL2 — that remains the S3b refinement.
+  ticks, clean shutdown — exercising stage-2 RAM + vGIC + virtio-console in one guest. (Originally
+  the guest re-armed each tick with an `HVC_TICK` hypercall; S6 replaced that with a real hardware
+  timer and PSCI shutdown.)
+- **S6 — hardware-timer tick + PSCI/SMC (DONE).** Two refinements that make the guest behave like a
+  real kernel rather than leaning on Bismuth-specific hypercalls:
+  - *Hardware-timer-driven tick.* The hypervisor arms the **EL2 physical timer** (`CNTHP_*_EL2`,
+    PPI INTID 26) and routes physical IRQs to EL2 (`HCR_EL2.IMO`). It fires on a free-running
+    cadence while the guest runs at EL1; the EL2 IRQ vector (Lower-EL-AArch64 IRQ slot) re-arms the
+    one-shot (`CNTHP_TVAL_EL2`) and injects the guest's virtual-timer vIRQ (27) through `GICH_LR0`.
+    The guest no longer requests ticks — `HVC_TICK` is gone from the guest path.
+  - *PSCI over SMC.* `HCR_EL2.TSC=1` traps the guest's `SMC` to EL2 (ESR_EL2 EC 0x17); the shim
+    emulates a PSCI 1.1 subset — `PSCI_VERSION` (→ 0x00010001), `SYSTEM_OFF`/`SYSTEM_RESET` (stop
+    the VM), `PSCI_FEATURES`, `MIGRATE_INFO_TYPE`, and `CPU_ON` (NOT_SUPPORTED for the single vCPU)
+    — returning the result in `x0` and skipping the `smc`. The capstone guest now powers the VM off
+    with a real `SYSTEM_OFF` SMC instead of an exit hypercall. QEMU-verified: banner, five
+    hardware-timer ticks via the vGIC, PSCI power-off.
 
 ## What the hypervisor can do today
 
@@ -126,8 +139,11 @@ A `--features hypervisor` Bismuth boot (QEMU `-M virt,virtualization=on`) is a w
 type-1 hypervisor: it runs at **EL2**, creates a guest VM with its own **stage-2-translated RAM**
 (guest accesses outside it fault to EL2), a **vGIC** that injects virtual interrupts the guest
 acks/EOIs through its own GICV, an emulated **virtio-mmio console** driven by the standard guest
-virtio handshake + virtqueue (trap-and-emulate), and a small **hypercall ABI**. The capstone guest
-"OS" uses all of these together. What a real Linux guest additionally needs is enumerated next.
+virtio handshake + virtqueue (trap-and-emulate), a **free-running hardware-timer tick** (the EL2
+physical timer injecting the guest's virtual-timer IRQ on its own cadence), **PSCI-over-SMC** power
+control (`VERSION`/`SYSTEM_OFF`/`RESET`/`FEATURES`/`CPU_ON`), and a small **hypercall ABI**. The
+capstone guest "OS" uses all of these together and powers itself off via PSCI. What a real Linux
+guest additionally needs is enumerated next.
 
 ## The honest blocker for *literal* Linux/Docker
 
@@ -145,12 +161,15 @@ hypervisor-side work on top of S1–S5 is:
 - **Load + entry:** place the `Image` at the guest-physical kernel offset and the DTB in guest RAM;
   enter with `x0` = DTB IPA per the Linux aarch64 boot protocol (bigger `GUEST_RAM` arena — tens of
   MiB — and a stage-2 map to match).
-- **PSCI/SMC:** emulate PSCI over `SMC`/`HVC` (`CPU_ON`, `SYSTEM_OFF`, `PSCI_VERSION`) so the guest
-  can probe power/CPU bring-up (trap `SMC` at EL2 via `HCR_EL2.TSC`). Single-vCPU first.
+- **PSCI/SMC:** ✅ DONE (S6) — PSCI over `SMC` trapped via `HCR_EL2.TSC` (`VERSION`, `SYSTEM_OFF`,
+  `SYSTEM_RESET`, `FEATURES`, `CPU_ON`→NOT_SUPPORTED single-vCPU). A real multi-vCPU guest would
+  extend `CPU_ON` to actually start a second vCPU context.
+- **Hardware timer:** ✅ DONE (S6) — the EL2 physical timer (`CNTHP_*_EL2`) drives ticks on a
+  free-running cadence, injecting the guest's virtual-timer vIRQ with no guest hypercall. (A real
+  guest that programs its *own* `CNTV` would also want `CNTVOFF_EL2` + trapping `CNTV` accesses; the
+  injection/LR-refill mechanism is the same one proven here.)
 - **vGIC distributor:** present a fuller **GICD** (trap-and-emulate `ISENABLER`/`IPRIORITYR`/etc., or
   GICv3 `GICR`) — Linux configures the distributor, not just the CPU interface.
-- **Hardware virtual timer:** wire the real `CNTV` path (`CNTVOFF_EL2`, trap the timer PPI to EL2,
-  refill list registers on the maintenance interrupt) so time advances without guest hypercalls.
 - **virtio-blk / virtio-net backends:** extend the S4 virtio-mmio emulator with block (serve a
   Bismuth VFS file / RAM disk as the rootfs) and net (bridge to the in-tree NIC), plus used-buffer
   vIRQ injection, so the guest has a root filesystem and I/O.
