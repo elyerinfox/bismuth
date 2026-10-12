@@ -109,9 +109,25 @@ interrupt injection. Guest EL0<->EL1 syscalls run natively and never trap to EL2
   guest data (the guest drives the MMIO protocol + doorbell); polled single-shot drain with no
   used-buffer vIRQ injected back (the S3 vGIC path would carry that); block/net virtio backends
   (serving Bismuth's VFS/NIC to the guest) are the S4b extension.
-- **S5 — boot a minimal guest OS.** With S2–S4, load a guest `Image`+DTB at the guest-physical
-  kernel address and boot it. Demonstrable here with a *hand-assembled* mini-guest that uses the
-  vGIC/timer/virtio (same no-toolchain tactic as the Linux-ABI ELFs).
+- **S5 — a minimal guest OS (DONE).** One hand-assembled guest at EL1 that ties S2–S4 together:
+  it sets `VBAR_EL1` + an EL1 vector table, runs the virtio-mmio console handshake and prints a
+  boot banner through it, enables its vGIC CPU interface (`GICV_CTLR`/`PMR`) and unmasks IRQs, then
+  WFI-loops. Each hypervisor-injected virtual-timer vIRQ (vINTID 27) enters the guest's IRQ vector
+  (Current-EL-SPx slot), which acks via `GICV_AIAR`, prints `scheduler tick #N` **through the
+  virtio-console** (not a raw hypercall), `GICV_AEOIR`s, and requests the next tick via `HVC_TICK`;
+  after 5 ticks it prints a shutdown line and `HVC_EXIT`s. QEMU-verified end to end — banner, five
+  ticks, clean shutdown — exercising stage-2 RAM + vGIC + virtio-console in one guest. Timer-driver
+  choice: the S3-documented `HVC_TICK` re-inject cadence (the guest requests the next tick from its
+  handler), not a hardware `CNTV`-armed maintenance loop at EL2 — that remains the S3b refinement.
+
+## What the hypervisor can do today
+
+A `--features hypervisor` Bismuth boot (QEMU `-M virt,virtualization=on`) is a working minimal
+type-1 hypervisor: it runs at **EL2**, creates a guest VM with its own **stage-2-translated RAM**
+(guest accesses outside it fault to EL2), a **vGIC** that injects virtual interrupts the guest
+acks/EOIs through its own GICV, an emulated **virtio-mmio console** driven by the standard guest
+virtio handshake + virtqueue (trap-and-emulate), and a small **hypercall ABI**. The capstone guest
+"OS" uses all of these together. What a real Linux guest additionally needs is enumerated next.
 
 ## The honest blocker for *literal* Linux/Docker
 
@@ -121,6 +137,29 @@ prebuilt image**, so the *mechanism* (S1–S5) is buildable and verifiable here,
 "unmodified Ubuntu" step requires an external artifact that must be supplied. The same ceiling the
 Linux-ABI path hit: Bismuth's side is implementable and testable with hand-assembled guests;
 producing/fetching a real distro image is an environment limit, not a kernel limit.
+
+### To boot a real aarch64 Linux guest (concrete remaining work)
+
+With a Linux `Image` + DTB in hand (on real hardware or a networked build host), the remaining
+hypervisor-side work on top of S1–S5 is:
+- **Load + entry:** place the `Image` at the guest-physical kernel offset and the DTB in guest RAM;
+  enter with `x0` = DTB IPA per the Linux aarch64 boot protocol (bigger `GUEST_RAM` arena — tens of
+  MiB — and a stage-2 map to match).
+- **PSCI/SMC:** emulate PSCI over `SMC`/`HVC` (`CPU_ON`, `SYSTEM_OFF`, `PSCI_VERSION`) so the guest
+  can probe power/CPU bring-up (trap `SMC` at EL2 via `HCR_EL2.TSC`). Single-vCPU first.
+- **vGIC distributor:** present a fuller **GICD** (trap-and-emulate `ISENABLER`/`IPRIORITYR`/etc., or
+  GICv3 `GICR`) — Linux configures the distributor, not just the CPU interface.
+- **Hardware virtual timer:** wire the real `CNTV` path (`CNTVOFF_EL2`, trap the timer PPI to EL2,
+  refill list registers on the maintenance interrupt) so time advances without guest hypercalls.
+- **virtio-blk / virtio-net backends:** extend the S4 virtio-mmio emulator with block (serve a
+  Bismuth VFS file / RAM disk as the rootfs) and net (bridge to the in-tree NIC), plus used-buffer
+  vIRQ injection, so the guest has a root filesystem and I/O.
+- **Console:** the S4 virtio-console already serves guest output; add RX for input.
+
+None of these are blocked *in principle* — they are more of the same trap-and-emulate the S1–S5
+mechanism already demonstrates — but together they are a substantial build, and the final boot
+still needs the external kernel image this sandbox cannot provide. Then `docker`/`k8s` inside that
+Linux guest is ordinary Linux userspace, unmodified.
 
 ## Stage-1 implementation notes
 
@@ -132,6 +171,8 @@ producing/fetching a real distro image is an environment limit, not a kernel lim
   `hvc_entry`, and `eret`s back. `run_guest(blob)` prints the EL (proving EL2), copies the guest
   into RAM, sets `HCR_EL2.RW`/`SP_EL1`/`ELR_EL2`/`SPSR_EL2`, and `eret`s to EL1. Hypercall ABI:
   `x0` = command (1 = print `[x1..x1+x2)`, 2 = exit `x1`).
-- Guest: `boards/qemu-virt-aarch64/src/hv_guest.rs` — a 108-byte decode-verified blob that prints
-  via `HVC_PRINT` then `HVC_EXIT`.
+- Guest: `boards/qemu-virt-aarch64/src/hv_guest.rs` — a decode-verified blob, grown across the
+  stages; at S5 it is the mini "guest OS" (VBAR_EL1 + vector table, virtio-console handshake +
+  banner, vGIC enable + unmask, WFI loop printing timer ticks via the virtio-console, shutdown).
+  Hypercall ABI: `x0` = command (1 = print `[x1..x1+x2)`, 2 = exit `x1`, 3 = inject next timer tick).
 - Run: `bash boards/qemu-virt-aarch64/run-hv.sh` (QEMU `-M virt,virtualization=on`).
